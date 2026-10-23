@@ -96,7 +96,7 @@ ban-relative-imports = "all"
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 
