@@ -1,0 +1,32 @@
+# Local stack: the API and PostgreSQL. The credentials are for local use only.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ledgerline
+      POSTGRES_PASSWORD: ledgerline
+      POSTGRES_DB: ledgerline
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledgerline -d ledgerline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledgerline:ledgerline@db:5432/ledgerline
+      LEDGERLINE_API_KEYS: ${LEDGERLINE_API_KEYS:-dev-key-change-me}
+    # Apply migrations, then serve. With several replicas, run the migration as a
+    # separate one-off step so replicas do not race to apply it.
+    command: ["sh", "-c", "alembic upgrade head && exec ledgerline serve --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
