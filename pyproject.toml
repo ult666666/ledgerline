@@ -89,6 +89,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests use bare asserts and obviously fake credentials.
 "tests/**" = ["S101", "S105", "S106"]
+# Dev scripts run fixed commands built from sys.executable, not user input.
+"scripts/**" = ["S603"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -96,7 +98,7 @@ ban-relative-imports = "all"
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests", "migrations"]
+files = ["src", "tests", "migrations", "scripts"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 
@@ -104,6 +106,12 @@ warn_unreachable = true
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+# pgserver is an optional, untyped dev tool that is never installed in the project
+# environment (see scripts/pytest_on_pgserver.py).
+module = ["pgserver"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
