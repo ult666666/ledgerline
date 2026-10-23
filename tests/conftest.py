@@ -9,13 +9,17 @@ import os
 from collections.abc import Iterator
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.engine import make_url
 
+from ledgerline.api.app import create_app
 from ledgerline.config import Settings
 from ledgerline.db import create_db_engine, create_session_factory
 from ledgerline.models import Base
 from ledgerline.service import LedgerService
+from tests.support import API_KEY
 
 
 @pytest.fixture(scope="session")
@@ -61,3 +65,19 @@ def db(engine: Engine) -> Engine:
 @pytest.fixture
 def service(db: Engine) -> LedgerService:
     return LedgerService(create_session_factory(db))
+
+
+@pytest.fixture
+def settings(database_url: str) -> Settings:
+    return Settings(database_url=database_url, api_keys=[API_KEY], _env_file=None)
+
+
+@pytest.fixture
+def app(settings: Settings, db: Engine) -> FastAPI:
+    return create_app(settings, engine=db)
+
+
+@pytest.fixture
+def client(app: FastAPI) -> Iterator[TestClient]:
+    with TestClient(app, headers={"Authorization": f"Bearer {API_KEY}"}) as test_client:
+        yield test_client
