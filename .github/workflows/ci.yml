@@ -24,7 +24,7 @@ jobs:
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.2
       - name: Install dependencies
         run: uv sync --locked
       - name: Ruff lint
@@ -57,7 +57,7 @@ jobs:
       DATABASE_URL: postgresql+psycopg://ledgerline:ledgerline@localhost:5432/ledgerline_test
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.2
       - name: Install dependencies
         run: uv sync --locked
       - name: Apply migrations
