@@ -509,11 +509,12 @@ This is a portfolio project, not production software. In particular:
 - **No account updates or closures and no transaction search;** no
   multi-tenancy, sharding, event streaming (outbox) or metrics and tracing
   export.
-- **Not verified locally:** the Docker image, the compose stack and the CI
-  workflow (Docker is not installed on the development machine); they are
-  first exercised when the workflow runs on GitHub. The test suite was run
-  locally on SQLite (Python 3.12 and 3.13) and on PostgreSQL 16.2 through
-  pgserver; CI targets PostgreSQL 17.
+- **Verification scope:** hosted CI runs the suite on SQLite (Python 3.12 and
+  3.13) and on PostgreSQL 17, validates `docker-compose.yml`, builds the image
+  and smoke-tests the running container (health check, `/healthz`, `/readyz`
+  and an authenticated API call). The compose stack itself has not been run
+  end to end. Locally the suite also passed on PostgreSQL 16.2 through
+  pgserver.
 
 ## References
 
