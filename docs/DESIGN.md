@@ -417,6 +417,16 @@ idempotency records identify clients by a 16-hex-digit fingerprint of their key.
 This is enough for a single trusted caller; section 13 covers what real
 deployments need.
 
+The SHA-256 digests here are used for fixed-length comparison and stable
+bearer-token fingerprints, **not password storage**. A fingerprint can permit
+offline guessing of a weak human-chosen key if logs or idempotency records
+are exposed. Use the CLI to generate a 32-byte random bearer token; do not
+use the disposable example key outside local demos. Token entropy is an
+operational requirement, not a validation rule. See [security review #4](https://github.com/ult666666/ledgerline/issues/4)
+for the CodeQL findings and any future fingerprint design changes. Any
+change to fingerprint derivation must preserve principal stability across
+service restarts to avoid breaking durable idempotency.
+
 ## 12. Testing strategy
 
 | Layer | File | What it shows |

@@ -28,3 +28,32 @@ def test_a_command_is_required(capsys: pytest.CaptureFixture[str]) -> None:
         cli.main([])
     assert caught.value.code == 2
     assert "serve" in capsys.readouterr().err
+
+
+def test_generate_key_does_not_load_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_random_token(nbytes: int) -> str:
+        assert nbytes == 32
+        return "synthetic-test-token"
+
+    def unexpected_settings() -> None:
+        raise AssertionError("key generation must not read application settings")
+
+    monkeypatch.setattr(cli.secrets, "token_urlsafe", fake_random_token)
+    monkeypatch.setattr(cli, "Settings", unexpected_settings)
+    assert cli.main(["generate-key"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "synthetic-test-token\n"
+    assert captured.err == ""
+
+
+def test_generate_key_output_is_urlsafe_and_correct_length(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import re
+
+    assert cli.main(["generate-key"]) == 0
+    token = capsys.readouterr().out.strip()
+    # Base64url without padding encodes 32 random bytes in 43 characters.
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", token)

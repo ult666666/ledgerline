@@ -1,6 +1,7 @@
-"""Command-line entry point: ``ledgerline serve`` and ``ledgerline reconcile``."""
+"""Command-line entry point: serve, reconcile and secure bearer-key generation."""
 
 import argparse
+import secrets
 import sys
 from collections.abc import Sequence
 
@@ -16,6 +17,11 @@ from ledgerline.reconcile import reconcile
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "generate-key":
+        # 32 bytes of OS randomness, URL-safe for use as a bearer token.
+        # Do not read application configuration or log the generated secret.
+        print(secrets.token_urlsafe(32))
+        return 0
     settings = Settings()
     if args.command == "serve":
         return _serve(settings, host=args.host, port=args.port)
@@ -32,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
         "reconcile",
         help="check stored balances and the trial balance; exits 1 if anything is off",
     )
+    commands.add_parser("generate-key", help="print a new random bearer token; keep it secret")
     return parser
 
 
