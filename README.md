@@ -100,6 +100,18 @@ smoke-tests the image and validates the compose file (see
 | `LEDGERLINE_API_KEYS` | (empty) | Comma-separated bearer tokens. With none configured every `/v1` request gets a `401`. |
 | `LEDGERLINE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
 
+### Bearer-key safety
+
+The `dev-key-change-me` value in the disposable Docker example is **local-only**. Never use it on an exposed server. Generate a new token from 32 cryptographically random bytes:
+
+```sh
+uv run ledgerline generate-key
+```
+
+Store the resulting secret in `LEDGERLINE_API_KEYS` through a protected environment or secret manager; do not commit it, paste it into issues, or include it in logs. Use HTTPS, rotate compromised tokens and prefer an identity provider with scoped credentials for real deployments.
+
+The service deliberately uses deterministic, truncated SHA-256 bearer-key fingerprints as client principals for logs and durable idempotency records. They are **not password hashes**. If a fingerprint or log leaks, weak human-chosen tokens can be guessed offline. High-entropy random tokens are therefore an operational requirement; the service does not enforce entropy. The CodeQL findings and further hardening are tracked in [security issue #4](https://github.com/ult666666/ledgerline/issues/4).
+
 ## API walkthrough
 
 Everything below was run against a local server (`uv run ledgerline serve` on
