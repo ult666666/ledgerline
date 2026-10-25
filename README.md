@@ -52,6 +52,22 @@ tests each one. The reasoning behind every choice is in
 
 ## Quick start
 
+### Disposable wallet demo
+
+Run a complete wallet lifecycle over real loopback HTTP after installing the
+source checkout's dependencies:
+
+```bash
+uv sync
+uv run python examples/wallet_demo.py
+```
+
+The command owns a temporary SQLite database and an ephemeral local server. It
+prints a checked JSON receipt for deposit, transfer, same-key replay, overdraft
+refusal, reversal, historical balances and reconciliation, then removes its
+resources. The [walkthrough](docs/WALLET_DEMO.md) explains the integer-cent
+balances, process ownership, deadlines and receipt fields.
+
 ### Locally with uv and SQLite
 
 Requires [uv](https://docs.astral.sh/uv/).
