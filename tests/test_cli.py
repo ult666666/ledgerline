@@ -1,5 +1,6 @@
 """The ``ledgerline`` command-line entry point."""
 
+import secrets
 from typing import Any
 
 import pytest
@@ -40,7 +41,7 @@ def test_generate_key_does_not_load_settings(
     def unexpected_settings() -> None:
         raise AssertionError("key generation must not read application settings")
 
-    monkeypatch.setattr(cli.secrets, "token_urlsafe", fake_random_token)
+    monkeypatch.setattr(secrets, "token_urlsafe", fake_random_token)
     monkeypatch.setattr(cli, "Settings", unexpected_settings)
     assert cli.main(["generate-key"]) == 0
     captured = capsys.readouterr()
