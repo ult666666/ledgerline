@@ -1,5 +1,7 @@
 """Cross-cutting HTTP behaviour: authentication, problem responses, health and request IDs."""
 
+import logging
+import secrets
 from collections.abc import Iterator
 
 import pytest
@@ -55,6 +57,34 @@ class TestAuthentication:
         assert authenticate_api_key("anything", []) is None
         assert len(key_fingerprint("first-key")) == 16
         assert key_fingerprint("first-key") != key_fingerprint("second-key")
+
+    def test_fingerprints_are_stable_across_restarts(self) -> None:
+        # Idempotency records are stored under this value, so it must never depend
+        # on process state. This pins it to the SHA-256 prefix of the key.
+        assert key_fingerprint("first-key") == "9e24b55356ef2a12"
+
+    @staticmethod
+    def startup_warnings(
+        settings: Settings, db: Engine, caplog: pytest.LogCaptureFixture, keys: list[str]
+    ) -> list[str]:
+        app = create_app(settings.model_copy(update={"api_keys": keys}), engine=db)
+        with caplog.at_level(logging.WARNING, logger="ledgerline.api.app"), TestClient(app):
+            pass
+        return [r.getMessage() for r in caplog.records if r.name == "ledgerline.api.app"]
+
+    def test_short_keys_are_reported_at_startup_without_the_keys(
+        self, settings: Settings, db: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        keys = ["short-demo-key", secrets.token_urlsafe(32)]
+        [message] = self.startup_warnings(settings, db, caplog, keys)
+        assert message.startswith("short keys in LEDGERLINE_API_KEYS: 1 of 2 (under 32 characters)")
+        assert "ledgerline generate-key" in message
+        assert not any(key in message for key in keys)
+
+    def test_generated_keys_start_without_a_warning(
+        self, settings: Settings, db: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        assert self.startup_warnings(settings, db, caplog, [secrets.token_urlsafe(32)]) == []
 
 
 class TestHealth:

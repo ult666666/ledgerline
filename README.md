@@ -47,50 +47,45 @@ tests each one. The reasoning behind every choice is in
   [error catalogue](docs/errors.md).
 - **Operations basics:** structured JSON logs with request IDs and timings,
   `/healthz` and `/readyz`, bearer API keys compared in constant time, a
-  `ledgerline reconcile` command, Alembic migrations, a Docker image and a
-  docker-compose stack with PostgreSQL.
+  `ledgerline reconcile` command, Alembic migrations, a Docker image that CI
+  smoke-tests, and a docker-compose file with PostgreSQL.
 
 ## Quick start
 
-### Disposable wallet demo
-
-Run a complete wallet lifecycle over real loopback HTTP after installing the
-source checkout's dependencies:
-
-```bash
-uv sync
-uv run python examples/wallet_demo.py
-```
-
-The command owns a temporary SQLite database and an ephemeral local server. It
-prints a checked JSON receipt for deposit, transfer, same-key replay, overdraft
-refusal, reversal, historical balances and reconciliation, then removes its
-resources. The [walkthrough](docs/WALLET_DEMO.md) explains the integer-cent
-balances, process ownership, deadlines and receipt fields.
-
-### Locally with uv and SQLite
-
-Requires [uv](https://docs.astral.sh/uv/).
+Requires [uv](https://docs.astral.sh/uv/). Clone the repository and install its
+dependencies:
 
 ```bash
 git clone https://github.com/ult666666/ledgerline.git
 cd ledgerline
 uv sync
+```
+
+### Wallet demo
+
+Run a deposit, a transfer, a retried request, a refused overdraft and a
+reversal against a temporary local server and database. The demo cleans up
+after itself:
+
+```bash
+uv run python examples/wallet_demo.py
+```
+
+It prints a JSON receipt with the result of every check, the historical
+balances and a final reconciliation. The [walkthrough](docs/WALLET_DEMO.md)
+explains the integer-cent balances, the temporary server, deadlines and
+receipt fields.
+
+### Run the API locally with SQLite
+
+```bash
 cp .env.example .env          # SQLite file + a placeholder API key
 uv run alembic upgrade head   # create the schema
 uv run ledgerline serve       # http://127.0.0.1:8000, interactive docs at /docs
 ```
 
-### With Docker Compose and PostgreSQL
-
-```bash
-docker compose up --build     # API on http://127.0.0.1:8000, PostgreSQL 17 alongside
-```
-
-The API container applies migrations before it starts. The API key defaults to
-`dev-key-change-me`; set `LEDGERLINE_API_KEYS` to override it. CI builds and
-smoke-tests the image and validates the compose file (see
-[Limitations](#limitations-and-roadmap)).
+The placeholder key is for local use only. For anything else, generate a key
+with `uv run ledgerline generate-key` (see [Security notes](#security-notes)).
 
 ### Configuration
 
@@ -99,18 +94,6 @@ smoke-tests the image and validates the compose file (see
 | `DATABASE_URL` | `sqlite:///./ledgerline.db` | SQLAlchemy URL. `postgres://` and `postgresql://` URLs are switched to the psycopg 3 driver. |
 | `LEDGERLINE_API_KEYS` | (empty) | Comma-separated bearer tokens. With none configured every `/v1` request gets a `401`. |
 | `LEDGERLINE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
-
-### Bearer-key safety
-
-The `dev-key-change-me` value in the disposable Docker example is **local-only**. Never use it on an exposed server. Generate a new token from 32 cryptographically random bytes:
-
-```sh
-uv run ledgerline generate-key
-```
-
-Store the resulting secret in `LEDGERLINE_API_KEYS` through a protected environment or secret manager; do not commit it, paste it into issues, or include it in logs. Use HTTPS, rotate compromised tokens and prefer an identity provider with scoped credentials for real deployments.
-
-The service deliberately uses deterministic, truncated SHA-256 bearer-key fingerprints as client principals for logs and durable idempotency records. They are **not password hashes**. If a fingerprint or log leaks, weak human-chosen tokens can be guessed offline. High-entropy random tokens are therefore an operational requirement; the service does not enforce entropy. The CodeQL findings and further hardening are tracked in [security issue #4](https://github.com/ult666666/ledgerline/issues/4).
 
 ## API walkthrough
 
@@ -441,7 +424,7 @@ flowchart LR
 | `domain.py` | Pure double-entry rules (balancing, normal balances, overdrafts, transfers, reversals) |
 | `repository.py` | Every SQL statement, including the version-checked balance update |
 | `models.py`, `migrations/` | Typed SQLAlchemy models (`Mapped[...]`) and the Alembic migration, with CHECK, UNIQUE and FK constraints |
-| `reconcile.py`, `cli.py` | Recompute the invariants from the journal; `ledgerline serve` and `ledgerline reconcile` |
+| `reconcile.py`, `cli.py` | Recompute the invariants from the journal; `ledgerline serve`, `ledgerline reconcile` and `ledgerline generate-key` |
 | `observability.py` | JSON log formatter and the request-ID context variable |
 
 A write runs in one database transaction: look up the idempotency key, load
@@ -512,6 +495,36 @@ CI (`.github/workflows/ci.yml`) runs lint, types and tests on Python 3.12 and
 3.13 with SQLite, the migrations and suite against a PostgreSQL 17 service
 container, and a Docker build with a smoke test.
 
+## Docker Compose with PostgreSQL (not yet run end to end)
+
+`docker-compose.yml` starts the API next to a PostgreSQL 17 database. CI checks
+that the file is valid and smoke-tests the API image on its own, but the full
+compose stack has not been run end to end yet, so treat it as a starting point:
+
+```bash
+docker compose up --build     # API on http://127.0.0.1:8000, PostgreSQL 17 alongside
+```
+
+The API container applies migrations before it starts. The API key defaults to
+`dev-key-change-me`, which is for local use only; set `LEDGERLINE_API_KEYS` to
+override it.
+
+## Security notes
+
+- **Use generated keys.** `uv run ledgerline generate-key` prints a token made
+  from 32 random bytes. Keep it in a protected environment or secret manager,
+  never commit it or paste it into issues or logs, and send it only over HTTPS.
+  The `dev-key-change-me` placeholder is for local demos only; the service logs
+  a warning at startup if any configured key is shorter than 32 characters.
+- **Why SHA-256 and not a password hash.** The service hashes bearer keys with
+  SHA-256 for the constant-time comparison, and logs and idempotency records
+  name each client by the first 16 hex digits of that hash. This is the
+  standard pattern for random tokens: nobody can recover a 256-bit token from
+  its hash, and a slow password hash would only add work to every request. It
+  does not protect a weak, hand-typed key, which someone with the logs could
+  guess offline. [docs/DESIGN.md](docs/DESIGN.md#11-errors-logging-and-authentication)
+  has the details.
+
 ## Limitations and roadmap
 
 This is a portfolio project, not production software. In particular:
@@ -540,9 +553,7 @@ This is a portfolio project, not production software. In particular:
 - **Verification scope:** hosted CI runs the suite on SQLite (Python 3.12 and
   3.13) and on PostgreSQL 17, validates `docker-compose.yml`, builds the image
   and smoke-tests the running container (health check, `/healthz`, `/readyz`
-  and an authenticated API call). The compose stack itself has not been run
-  end to end. Locally the suite also passed on PostgreSQL 16.2 through
-  pgserver.
+  and an authenticated API call). It does not start the compose stack.
 
 ## References
 
