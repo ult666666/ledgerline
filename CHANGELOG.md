@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `examples/wallet_demo.py`: a wallet lifecycle (deposit, transfer, retried
+  request, refused overdraft, reversal, historical balances, reconciliation)
+  against a temporary local server and database. The walkthrough is in
+  `docs/WALLET_DEMO.md`.
+- `ledgerline generate-key`, which prints a bearer token made from 32 random
+  bytes.
+- A startup warning when a configured API key is shorter than 32 characters.
+  The warning reports a count and never the keys.
+- Monthly Dependabot updates for uv dependencies and GitHub Actions.
+
+### Changed
+
+- The build backend requirement is now `uv_build>=0.13.5,<0.14.0`.
+
 ## 0.1.0 - 2026-10-23
 
 ### Added

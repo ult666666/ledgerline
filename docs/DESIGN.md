@@ -417,15 +417,37 @@ idempotency records identify clients by a 16-hex-digit fingerprint of their key.
 This is enough for a single trusted caller; section 13 covers what real
 deployments need.
 
-The SHA-256 digests here are used for fixed-length comparison and stable
-bearer-token fingerprints, **not password storage**. A fingerprint can permit
-offline guessing of a weak human-chosen key if logs or idempotency records
-are exposed. Use the CLI to generate a 32-byte random bearer token; do not
-use the disposable example key outside local demos. Token entropy is an
-operational requirement, not a validation rule. See [security review #4](https://github.com/ult666666/ledgerline/issues/4)
-for the CodeQL findings and any future fingerprint design changes. Any
-change to fingerprint derivation must preserve principal stability across
-service restarts to avoid breaking durable idempotency.
+**Why SHA-256 and not a password hash.** Code scanners such as CodeQL flag
+SHA-256 on secrets like these keys because the same call would be wrong for
+passwords. People choose passwords, so they have little entropy and need a
+slow, salted hash that makes a stolen hash table expensive to attack. The keys
+here are meant to be random tokens from `ledgerline generate-key`: 32 bytes
+from the operating system's random source, or 256 bits. No hash speed makes
+2^256 guesses feasible, so a fast hash gives nothing away, while a slow one
+would add work to every authenticated request. Storing a plain SHA-256 of a
+random API token is the common approach for this reason.
+
+The remaining risk is a weak key that a person typed, such as the local
+`dev-key-change-me` placeholder. Anyone who can read the logs or the
+idempotency table could test guesses against its fingerprint offline (and,
+with no rate limiting, online too). The service logs a warning at startup when
+a configured key is shorter than 32 characters. Length is only a rough check;
+the real requirement is a generated key.
+
+Two stronger measures were considered and not adopted:
+
+- **Rejecting short keys at startup** would break the local demos and still
+  would not measure randomness.
+- **An HMAC keyed with a separate server-side secret** would make leaked
+  fingerprints useless without that secret. It adds a second secret to manage,
+  and every fingerprint changes when the secret is introduced or rotated.
+  Idempotency records are stored under the fingerprint, so a client retry that
+  spans such a change would miss its stored response and could post twice.
+  The trade is worth making only if hand-typed keys must be supported.
+
+Any future change to the fingerprint must keep it stable across restarts and
+database recovery, or migrate the stored idempotency records along with it. A
+test pins the current derivation to a known value.
 
 ## 12. Testing strategy
 

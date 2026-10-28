@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from sqlalchemy import Engine
 
 from ledgerline import __version__
+from ledgerline.api.auth import MIN_KEY_LENGTH, short_key_count
 from ledgerline.api.dependencies import authenticate
 from ledgerline.api.middleware import RequestContextMiddleware
 from ledgerline.api.problems import install_problem_handlers
@@ -31,6 +32,16 @@ def create_app(settings: Settings | None = None, *, engine: Engine | None = None
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if not settings.api_keys:
             logger.warning("LEDGERLINE_API_KEYS is empty: every /v1 request will get a 401")
+        # Report only a count: the keys themselves must never reach the logs.
+        if short := short_key_count(settings.api_keys):
+            logger.warning(
+                "short keys in LEDGERLINE_API_KEYS: %d of %d (under %d characters); "
+                "use them only for local demos and create real keys with "
+                "`ledgerline generate-key`",
+                short,
+                len(settings.api_keys),
+                MIN_KEY_LENGTH,
+            )
         yield
         if owns_engine:
             db_engine.dispose()
