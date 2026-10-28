@@ -17,10 +17,16 @@ All notable changes to this project are documented here. The format follows
 - A startup warning when a configured API key is shorter than 32 characters.
   The warning reports a count and never the keys.
 - Monthly Dependabot updates for uv dependencies and GitHub Actions.
+- `scripts/compose_smoke.py` and a CI job that runs the Docker Compose stack
+  (API and PostgreSQL 17) end to end: accounts, a deposit, a transfer, a
+  replayed retry, a rejected key reuse, a refused overdraft and 20 concurrent
+  transfers against one wallet, followed by `ledgerline reconcile`.
 
 ### Changed
 
 - The build backend requirement is now `uv_build>=0.13.5,<0.14.0`.
+- The full API walkthrough moved from the README to `docs/API_WALKTHROUGH.md`;
+  the README keeps the endpoint table and a short example.
 
 ## 0.1.0 - 2026-10-23
 

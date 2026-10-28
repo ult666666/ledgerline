@@ -102,3 +102,25 @@ jobs:
       - name: Container logs
         if: always()
         run: docker logs ledgerline
+
+  compose:
+    name: Run the Docker Compose stack end to end
+    runs-on: ubuntu-latest
+    env:
+      # One key for both sides: compose passes it to the API, the script sends it.
+      LEDGERLINE_API_KEYS: ci-compose-key-0123456789abcdef01234567
+      LEDGERLINE_API_KEY: ci-compose-key-0123456789abcdef01234567
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start PostgreSQL and the API
+        run: docker compose up --build --detach --wait --wait-timeout 180
+      - name: Drive the API end to end
+        run: python3 scripts/compose_smoke.py
+      - name: Reconcile the ledger inside the API container
+        run: docker compose exec -T api ledgerline reconcile
+      - name: Compose logs
+        if: always()
+        run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
