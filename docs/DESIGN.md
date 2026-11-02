@@ -20,7 +20,8 @@ guarantee, and which alternatives were considered. Code references point at
 12. [Errors, logging and authentication](#12-errors-logging-and-authentication)
 13. [Testing strategy](#13-testing-strategy)
 14. [Out of scope](#14-out-of-scope)
-15. [Questions worth being ready for](#15-questions-worth-being-ready-for)
+15. [Common questions](#15-common-questions)
+16. [References](#16-references)
 
 ## 1. Goals and non-goals
 
@@ -35,7 +36,7 @@ The service records money movements so that:
 - every guarantee is checked by tests, and the cached state can be re-verified
   from the journal at any time (`ledgerline reconcile`).
 
-It is deliberately small: one service, one database, synchronous request
+It is small on purpose: one service, one database, synchronous request
 handling. Payments rails, FX, multi-tenancy and horizontal scaling are out of
 scope (section 14).
 
@@ -620,7 +621,9 @@ length, and every configured key is checked so timing does not reveal which
 one matched. With no keys configured every `/v1` request is rejected. Logs and
 idempotency records identify clients by a 16-hex-digit fingerprint of their key.
 This is enough for a single trusted caller; section 14 covers what real
-deployments need.
+deployments need. A key from `ledgerline generate-key` belongs in a protected
+environment or secret manager: never commit it or paste it into issues or logs,
+and send it only over HTTPS.
 
 **Why SHA-256 and not a password hash.** Code scanners such as CodeQL flag
 SHA-256 on secrets like these keys because the same call would be wrong for
@@ -704,13 +707,46 @@ only on PostgreSQL, where the requests really race.
 The whole suite runs on SQLite by default and on PostgreSQL when
 `DATABASE_URL` points at a database whose name contains `test`.
 
+### Invariants, and where each is enforced and checked
+
+| Invariant | Enforced by | Checked by |
+| --- | --- | --- |
+| Every transaction has two or more non-zero entries on distinct accounts and sums to zero per currency | `domain.validate_entries`; `CHECK (amount <> 0)`, `UNIQUE (transaction_id, account_id)` | Unit tests, API tests, state machine, `reconcile` |
+| The trial balance is zero for every currency | Follows from the row above | State machine, `reconcile` |
+| A stored balance equals the sum of its account's entries | Balance and entries change in one DB transaction, guarded by the version check | State machine, threaded tests, `reconcile` |
+| An account with `allow_negative: false` never goes below zero | `domain.apply_entries` + compare-and-swap; `CHECK (allow_negative OR balance >= 0)` as a backstop | Threaded overdraft test, state machine |
+| Posted transactions never change; each has at most one reversal, which cannot itself be reversed | No update or delete paths; `UNIQUE (reverses_id)` | API tests, state machine |
+| One idempotency key, one effect | Response stored under `PRIMARY KEY (principal, key)` in the same DB transaction as the effect | Threaded duplicate test, forced key-race test, state machine replays |
+| Statement running balances match the entries | `balance_after` written with each entry | State machine |
+| Active holds never exceed the balance of an account with `allow_negative: false`; postings cannot spend held funds | Every posting and hold checks the available balance; every write that changes it compare-and-swaps the account's version | Hold state machine, threaded hold tests, `reconcile` |
+| A hold moves only from active to captured, voided or expired, once; captured never exceeds authorized | Guarded `UPDATE ... WHERE status = 'active' AND expires_at > now`; `CHECK`s on the fields each status sets | Hold state machine, race tests, constraint tests, `reconcile` |
+| Each captured hold is in the journal exactly once, for the captured amount | `UNIQUE (hold_id)` on transactions; the hold is closed before the posting is inserted | Race tests, `reconcile` |
+
+### What CI runs
+
+GitHub Actions runs ruff, strict mypy and the suite with coverage on Python 3.12
+and 3.13 against SQLite, then the migrations and the suite against a PostgreSQL 17
+service container. It validates `docker-compose.yml`, builds the image and
+smoke-tests the running container (health check, `/healthz`, `/readyz` and an
+authenticated API call).
+
+A last job starts the compose stack (the API and PostgreSQL 17) and drives it
+with `scripts/compose_smoke.py`. The script opens accounts, posts a deposit and a
+transfer, and checks a replayed retry, a rejected key reuse and a refused
+overdraft. It sends 20 concurrent transfers that together ask for more than the
+wallet holds; exactly the 15 that fit must succeed. It then sends 25 concurrent
+holds against a second wallet, of which exactly 20 must succeed, captures part of
+one, voids another and checks the ledger, held and available balances. Finally
+it runs `ledgerline reconcile` inside the API container.
+
 ## 14. Out of scope
 
 - **FX conversion.** Rates, rounding policy, quote expiry and the accounts for
   FX gains and losses are a product in themselves. The ledger already supports
   the bookkeeping (one transaction balanced per currency through conversion
   accounts); the conversion logic would live in a separate service that posts
-  to it.
+  to it. Currency codes are checked for format (three capital letters), not
+  against the ISO 4217 list.
 - **Multi-tenant authorization.** Today every key can touch every account. A
   real ledger needs tenants (a `tenant_id` on every row, enforced in every
   query or with PostgreSQL row-level security), per-client scopes such as
@@ -728,10 +764,10 @@ The whole suite runs on SQLite by default and on PostgreSQL when
   partial captures), no increasing an existing hold, no listing of holds per
   account, no maximum hold duration, and no pending credits on the
   destination side. Each is an extension of the same state machine.
-- Also not built: backdated entries, account closure, transaction search,
+- Also not built: backdated entries, account updates or closure, transaction search,
   rate limiting, metrics and tracing export.
 
-## 15. Questions worth being ready for
+## 15. Common questions
 
 **Why not store amounts as floats or decimals?** Floats cannot represent most
 decimal fractions exactly. Decimals would work, but integers of minor units
@@ -793,3 +829,17 @@ for statements and history, and partitioning the `entries` table by time. Then
 hot-account mitigation (section 7) and a transactional outbox for consumers.
 Sharding by tenant comes last, because cross-shard transfers need a two-phase
 protocol.
+
+## 16. References
+
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
+- [The Idempotency-Key HTTP Header Field (IETF draft)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+- [Stripe API: idempotent requests](https://docs.stripe.com/api/idempotent_requests)
+- [TigerBeetle: two-phase transfers](https://docs.tigerbeetle.com/coding/two-phase-transfers/)
+- [Stripe: place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method)
+- [PostgreSQL: transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html),
+  including how `UPDATE ... WHERE` behaves under concurrent updates at Read Committed
+- [SQLite: BEGIN IMMEDIATE](https://www.sqlite.org/lang_transaction.html)
+- [Exponential Backoff and Jitter (AWS Architecture Blog)](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+- Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 7
+  (transactions, lost updates and write skew)
