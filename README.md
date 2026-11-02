@@ -29,7 +29,9 @@ To see the main behaviours without starting anything yourself, run
 `uv run python examples/wallet_demo.py`. It runs a deposit, a transfer, a retried
 request, a refused overdraft and a reversal against a temporary server and database,
 prints a JSON summary of each check, and cleans up ([details](docs/WALLET_DEMO.md)).
-`docker compose up --build` starts the API next to PostgreSQL 17 instead.
+`docker compose up --build` starts the API next to PostgreSQL 17 instead; it applies
+the migrations first and uses the same placeholder key unless `LEDGERLINE_API_KEYS` is
+set.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
