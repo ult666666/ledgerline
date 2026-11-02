@@ -54,6 +54,10 @@ All notable changes to this project are documented here. The format follows
 - The build backend requirement is now `uv_build>=0.13.5,<0.14.0`.
 - The full API walkthrough moved from the README to `docs/API_WALKTHROUGH.md`;
   the README keeps the endpoint table and a short example.
+- The README is organised as run, API tour and design notes, with a short
+  limits list. The invariants table, the CI description and the references
+  moved to `docs/DESIGN.md`, and `docs/WALLET_DEMO.md` is rewritten in plain
+  language.
 
 ### Fixed
 

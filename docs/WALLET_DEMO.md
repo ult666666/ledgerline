@@ -1,4 +1,4 @@
-# Run a disposable wallet lifecycle
+# Wallet demo
 
 From a source checkout after `uv sync`, run:
 
@@ -6,15 +6,15 @@ From a source checkout after `uv sync`, run:
 uv run python examples/wallet_demo.py
 ```
 
-The example starts a real local HTTP service, exercises the wallet lifecycle,
-checks its accounting and retry invariants, then prints a JSON receipt after
-cleanup. It uses the project's existing Alembic migration, application factory
-and reconciliation API. All accounts and amounts belong to this disposable
-example; no payment provider or external service participates.
+The script starts the API on a temporary SQLite database, runs a short wallet
+lifecycle over HTTP, checks the accounting and retry rules after each step, cleans
+up, and prints a JSON summary. It uses the project's Alembic migrations, application
+factory and reconciliation code. Every account and amount is local to the run; no
+payment provider or other service is involved.
 
 ## What happens
 
-The bank cash account is debit-normal; Alice's and Bob's wallets are
+The bank's cash account is debit-normal; Alice's and Bob's wallets are
 credit-normal liabilities. All amounts are integer USD cents.
 
 | Step | Cash | Alice | Bob | Check |
@@ -26,65 +26,58 @@ credit-normal liabilities. All amounts are integer USD cents.
 | Reverse Alice's $25 transfer | 10000 | 10000 | 0 | A linked reversal; original entries unchanged |
 | Read balances at the transfer timestamp | 10000 | 7500 | 2500 | Historical state survives the reversal |
 
-The final reconciliation must report **3 accounts, 3 transactions, 6 entries**,
-matching cached balances and a zero USD trial balance. A replay or rejected
-request must not add journal entries. The example raises an error instead of
-printing a success receipt if any invariant fails.
+At the end, reconciliation must find 3 accounts, 3 transactions and 6 entries,
+cached balances that match the entries, and a zero USD trial balance. The replay and
+the refused transfer must not add journal entries. If any check fails, the script
+raises an error instead of printing a summary.
 
-The receipt includes actual account/transaction IDs, replay and rejection
-results, historical/current balances, each checked invariant, reconciliation
-results and cleanup evidence. IDs, timestamps, process IDs and ports vary on
-each run. The temporary API key is omitted.
-
-To save a receipt for inspection:
+The summary lists the account and transaction IDs, the replay and rejection results,
+historical and current balances, each check, the reconciliation result and the
+cleanup status. IDs, timestamps, process IDs and ports change from run to run, and the
+temporary API key is left out. To keep a copy:
 
 ```bash
-uv run python examples/wallet_demo.py > /tmp/ledgerline-wallet-receipt.json
+uv run python examples/wallet_demo.py > /tmp/ledgerline-wallet-demo.json
 ```
 
-## Ownership and time limits
+## Isolation and time limits
 
-The parent creates a `TemporaryDirectory` containing its SQLite database and
-binds an IPv4 socket to **127.0.0.1, port 0**. The operating system selects an
-unused port. The bound socket is passed directly to a spawned child process;
-there is no release-and-reacquire port gap and no discovery of existing servers.
+The script creates a temporary directory for its SQLite database and binds a socket
+to 127.0.0.1 on port 0, so the operating system picks a free port. It passes that
+socket straight to a child process, so there is no gap in which another program could
+take the port, and it never connects to a server that was already running.
 
-The child migrates that database and builds the app with explicit settings and
-`_env_file=None`. A caller's `DATABASE_URL`, `.env`, API keys and running service
-are not selected. The example accepts no external URL, database or port option.
-It requires neither Docker nor PostgreSQL, and it leaves the production service
-configuration unchanged.
+The child migrates the temporary database and builds the app with explicit settings
+and `_env_file=None`, so your `DATABASE_URL`, `.env` file and API keys are ignored.
+The script takes no URL, database or port option, and it needs neither Docker nor
+PostgreSQL.
 
-Startup/migration readiness and HTTP requests share a **15-second** deadline.
-Each HTTP call also has a timeout of at most one second. To choose a different
-finite positive deadline:
+Startup, migration and the HTTP requests share a 15-second deadline, and each HTTP
+call times out after at most one second. To choose another deadline:
 
 ```bash
 uv run python examples/wallet_demo.py --timeout 20
 ```
 
-The context manager runs cleanup on success, startup failure and workflow
-exceptions. It terminates and joins its own child, escalates to killing that
-same process if necessary, and bounds each join to two seconds. It closes its
-owned listener and deletes its own temporary directory. A receipt is emitted
-only after this cleanup completes; expected lifecycle rejection is part of a
-successful run. A deadline or failed invariant exits 1 with an error on stderr.
-Invalid CLI syntax uses argparse's exit 2.
+Cleanup runs after success, a startup failure or an error mid-run. The script stops
+the child process (killing it if it does not exit), waits at most two seconds each
+time, closes the socket and deletes the temporary directory. It prints the summary
+only after cleanup. The refused transfer is an expected part of a successful run. A
+missed deadline or a failed check exits with status 1 and an error on stderr; invalid
+arguments exit with status 2.
 
-Reconciliation runs locally against the owned SQLite database after all HTTP
-writes finish. It demonstrates the existing journal cross-check; it is not an
-additional HTTP endpoint. This small sequential demo demonstrates lifecycle
-mechanics. The existing [concurrency tests](../tests/test_concurrency.py) cover
-racing writes independently.
+Reconciliation runs in the script against the temporary database after the last HTTP
+write; it is not an HTTP endpoint. The demo is sequential and only shows the
+lifecycle. The [concurrency tests](../tests/test_concurrency.py) cover racing writes.
 
-## Verification
+## Tests
 
 ```bash
 uv run pytest tests/test_wallet_demo.py -q
 ```
 
-These tests run actual HTTP, inspect the receipt, preserve a caller-owned
-sentinel database, retain an unrelated listener, and check process/socket/file
-cleanup after both an explicit workflow exception and a startup deadline. They
-use the same disposable SQLite setup as the documented command and require no existing
-server.
+These tests run the script over HTTP and inspect its summary. They check that the
+database named in your `DATABASE_URL` and `.env` is left untouched, that an unrelated
+listening socket stays open, and that the child process, socket and temporary files
+are gone after both a failure mid-run and a missed startup deadline. Like the script,
+they need no running server.
