@@ -11,6 +11,7 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
+from ledgerline.domain import MAX_MAGNITUDE
 from tests.support import (
     FakeClock,
     Json,
@@ -175,6 +176,45 @@ class TestAuthorize:
         )
         authorize(clocked_client, promotions, bob, 5_000, expires_at=clock.now + HOUR)
         assert account_balances(clocked_client, promotions) == (0, 5_000, -5_000)
+
+    def test_holds_never_take_balances_outside_the_json_safe_range(
+        self, clocked_client: TestClient, clock: FakeClock, bob: Json
+    ) -> None:
+        # Funds do not limit an account that may go negative, so without a range
+        # check its holds could stack up without end: held_amount past 2**53 - 1,
+        # and on SQLite a SUM that overflows 64 bits after about 1,025 of them.
+        promotions = open_account(
+            clocked_client, name="Promotions", account_type="liability", allow_negative=True
+        )
+        authorize(clocked_client, promotions, bob, MAX_MAGNITUDE, expires_at=clock.now + HOUR)
+        response = post(
+            clocked_client,
+            "/v1/holds",
+            hold_body(promotions, bob, 1, expires_at=clock.now + HOUR),
+        )
+        assert response.status_code == 422
+        assert problem_type(response) == "invalid-transaction"
+        assert "available balance would leave the supported range" in response.json()["detail"]
+        assert account_balances(clocked_client, promotions) == (0, MAX_MAGNITUDE, -MAX_MAGNITUDE)
+
+    @pytest.mark.parametrize(
+        "expires_at",
+        # Valid ISO 8601 with an offset, but outside the years 1 to 9999 in UTC.
+        ["9999-12-31T23:00:00-05:00", "0001-01-01T00:30:00+01:00"],
+    )
+    def test_expires_at_must_be_representable_in_utc(
+        self,
+        clocked_client: TestClient,
+        clock: FakeClock,
+        alice: Json,
+        bob: Json,
+        expires_at: str,
+    ) -> None:
+        body = {**hold_body(alice, bob, 100, expires_at=clock.now + HOUR), "expires_at": expires_at}
+        response = post(clocked_client, "/v1/holds", body)
+        assert response.status_code == 422
+        assert problem_type(response) == "validation-error"
+        assert account_balances(clocked_client, alice) == (10_000, 0, 10_000)
 
     @pytest.mark.parametrize(
         "overrides",

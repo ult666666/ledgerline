@@ -319,6 +319,20 @@ class TestApplyEntriesWithHolds:
         )
         assert new[fully_held.id] == 501
 
+    def test_the_available_balance_stays_in_the_json_safe_range(self) -> None:
+        # An account that may go negative is not limited by its funds, so the
+        # range check is what keeps balance - held_amount inside +/-MAX_MAGNITUDE.
+        funding = account(normal_balance=NormalBalance.CREDIT, allow_negative=True, held=10)
+        other = account(normal_balance=NormalBalance.CREDIT)
+        accounts = {funding.id: funding, other.id: other}
+        limit = MAX_MAGNITUDE - 10
+        assert apply_entries(transfer_entries(funding, other, limit, "USD"), accounts) == {
+            funding.id: -limit,
+            other.id: limit,
+        }
+        with pytest.raises(InvalidTransaction, match="available balance would leave"):
+            apply_entries(transfer_entries(funding, other, limit + 1, "USD"), accounts)
+
 
 class TestHoldRules:
     def test_an_active_hold_expires_at_its_expires_at(self) -> None:
@@ -376,6 +390,33 @@ class TestHoldRules:
         source = account(normal_balance=NormalBalance.CREDIT, allow_negative=True, held=5_000)
         destination = account(normal_balance=NormalBalance.CREDIT)
         check_hold_request(source, destination, 10_000, "USD", expires_at=LATER, now=NOW)
+
+    def test_held_and_available_balances_stay_in_the_json_safe_range(self) -> None:
+        destination = account(normal_balance=NormalBalance.CREDIT)
+
+        def request(source: AccountState, amount: int) -> None:
+            check_hold_request(source, destination, amount, "USD", expires_at=LATER, now=NOW)
+
+        # held_amount may reach MAX_MAGNITUDE, never more.
+        rich = account(
+            normal_balance=NormalBalance.CREDIT,
+            allow_negative=True,
+            balance=MAX_MAGNITUDE,
+            held=MAX_MAGNITUDE - 5,
+        )
+        request(rich, 5)
+        with pytest.raises(InvalidHold, match="active holds") as caught:
+            request(rich, 6)
+        assert caught.value.extensions == {
+            "account_id": str(rich.id),
+            "held_amount": MAX_MAGNITUDE - 5,
+            "requested_amount": 6,
+        }
+        # available_balance may reach -MAX_MAGNITUDE, never less.
+        promised = account(normal_balance=NormalBalance.CREDIT, allow_negative=True, held=10)
+        request(promised, MAX_MAGNITUDE - 10)
+        with pytest.raises(InvalidTransaction, match="available balance would leave"):
+            request(promised, MAX_MAGNITUDE - 9)
 
     def test_a_hold_follows_the_transfer_rules(self) -> None:
         wallet = account(normal_balance=NormalBalance.CREDIT, balance=1_000)

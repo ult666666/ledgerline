@@ -135,7 +135,12 @@ Amounts are integers in the currency's minor unit (cents for USD).
 - **Bounded:** amounts and balances stay within +/-(2^53 - 1)
   (`domain.MAX_MAGNITUDE`). That is the largest integer a JavaScript client can
   parse from JSON without rounding, and it fits comfortably in a signed 64-bit
-  column.
+  column. The bound covers the held and available balances of section 10 too:
+  funds limit the holds of an account that cannot go negative, but not of one
+  that can, so a hold that would take `held_amount` above 2^53 - 1, or a hold or
+  posting that would take `available_balance` below -(2^53 - 1), is refused.
+  Without that check such an account could stack holds without end, and on
+  SQLite the `SUM` of about 1,025 maximal holds overflows 64 bits.
 
 The minor-unit exponent (2 for USD, 0 for JPY) is not stored; the service never
 needs it because it never converts or formats amounts.
