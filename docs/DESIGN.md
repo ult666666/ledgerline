@@ -15,11 +15,12 @@ guarantee, and which alternatives were considered. Code references point at
 7. [Concurrency control](#7-concurrency-control)
 8. [Idempotency](#8-idempotency)
 9. [Point-in-time balances and statements](#9-point-in-time-balances-and-statements)
-10. [Reconciliation](#10-reconciliation)
-11. [Errors, logging and authentication](#11-errors-logging-and-authentication)
-12. [Testing strategy](#12-testing-strategy)
-13. [Out of scope](#13-out-of-scope)
-14. [Questions worth being ready for](#14-questions-worth-being-ready-for)
+10. [Holds (two-phase transfers)](#10-holds-two-phase-transfers)
+11. [Reconciliation](#11-reconciliation)
+12. [Errors, logging and authentication](#12-errors-logging-and-authentication)
+13. [Testing strategy](#13-testing-strategy)
+14. [Out of scope](#14-out-of-scope)
+15. [Questions worth being ready for](#15-questions-worth-being-ready-for)
 
 ## 1. Goals and non-goals
 
@@ -29,12 +30,14 @@ The service records money movements so that:
 - history is append-only and auditable;
 - a retried request never moves money twice;
 - concurrent requests never overdraw an account or lose an update;
+- funds reserved by a hold cannot be spent twice, and a hold is captured,
+  voided or expires exactly once;
 - every guarantee is checked by tests, and the cached state can be re-verified
   from the journal at any time (`ledgerline reconcile`).
 
 It is deliberately small: one service, one database, synchronous request
 handling. Payments rails, FX, multi-tenancy and horizontal scaling are out of
-scope (section 13).
+scope (section 14).
 
 ## 2. Double-entry bookkeeping as implemented
 
@@ -162,13 +165,14 @@ original's with the signs flipped (`domain.reversal_entries`), linked through
 
 ## 5. Storage model
 
-Four tables, created by `migrations/versions/20261023_0001_create_ledger_tables.py`
-and mirrored by `models.py` (a test checks they agree):
+Five tables, created by the migrations in `migrations/versions/` (0001 for the
+ledger, 0002 for holds) and mirrored by `models.py` (a test checks they agree):
 
 | Table | Key columns | Constraints |
 | --- | --- | --- |
 | `accounts` | `balance BIGINT`, `version INTEGER`, `allow_negative` | `CHECK (allow_negative OR balance >= 0)`, enum CHECKs, index on `(created_at, id)` |
-| `transactions` | `posted_at`, `reverses_id` | FK `reverses_id -> transactions.id`, `UNIQUE (reverses_id)` |
+| `transactions` | `posted_at`, `reverses_id`, `hold_id` | FKs to `transactions.id` and `holds.id`, `UNIQUE (reverses_id)`, `UNIQUE (hold_id)` |
+| `holds` | `amount`, `status`, `captured_amount`, `created_at`, `expires_at`, `closed_at` | `CHECK`s on the amount, the stored status and the fields each status sets (section 10), index on `(from_account_id, status, expires_at)` |
 | `entries` | `amount BIGINT`, `currency`, `balance_after` | `CHECK (amount <> 0)`, `UNIQUE (transaction_id, account_id)`, FKs, index on `(account_id, id)` |
 | `idempotency_keys` | `(principal, key)` primary key, `fingerprint`, `response_body` | the primary key arbitrates races |
 
@@ -186,6 +190,21 @@ twice or overdraw an account; such a bug would surface as a 500 with a logged
 
 Timestamps use a small `UtcDateTime` type: PostgreSQL stores `timestamptz`,
 SQLite stores naive text, and the type normalises both to timezone-aware UTC.
+
+**Migrations.** The schema changes only through Alembic revisions, and tests
+check that `alembic upgrade head` builds exactly what the models describe.
+Revision 0002 adds `transactions.hold_id`. SQLite cannot add a foreign key to
+an existing table, so Alembic's batch mode rebuilds the table: copy, drop the
+old table, rename the copy. With `PRAGMA foreign_keys = ON` (which `db.py` sets
+on every connection) the drop fails as soon as `entries` reference any
+transaction; a test that upgrades a 0001 database holding data showed it.
+`migrations/env.py` therefore follows SQLite's documented procedure for such
+changes: it turns enforcement off for the migration connection, runs all
+revisions in one transaction (the explicit `BEGIN IMMEDIATE` makes SQLite DDL
+transactional), runs `PRAGMA foreign_key_check` before committing and turns
+enforcement back on. The rebuild is given the table definition (`copy_from`),
+so it needs no reflection and `alembic upgrade head --sql` still works offline.
+PostgreSQL adds the column and constraints with plain `ALTER TABLE`.
 
 ## 6. The write path
 
@@ -374,7 +393,174 @@ and does not skip or repeat rows when new rows are appended. Its blind spot is a
 row that commits later with a smaller key than a page the client has already
 read.
 
-## 10. Reconciliation
+## 10. Holds (two-phase transfers)
+
+Card payments and marketplaces reserve money before they move it: a card is
+authorized when the customer orders and captured when the goods ship, often
+for a different amount. A **hold** is that reservation. It is a transfer in
+two phases: authorize now, then capture (post) or void (release) later, or
+let it expire. TigerBeetle's pending transfers and Stripe's manual capture
+have the same shape ([references](#references-for-holds)).
+
+### Three balances
+
+| Field | Meaning |
+| --- | --- |
+| `balance` | The **ledger balance**: posted entries only. A hold never changes it. |
+| `held_amount` | The total of the account's active holds, as the source. |
+| `available_balance` | `balance - held_amount`: what the account can still spend or hold. |
+
+The funds rule changes from "the balance may not go below zero" to "the
+**available** balance may not go below zero", for accounts with
+`allow_negative: false`. It applies to every posting (transfers, journal
+transactions, reversals) and to new holds (`domain.apply_entries`). If
+postings could spend held money, a later capture could fail and a hold would
+reserve nothing. A hold's destination sees nothing until the capture posts:
+pending credits are not counted as available, so money cannot be spent before
+it arrives.
+
+### The state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> active: POST /v1/holds (funds available)
+    active --> captured: capture all or part, before expires_at
+    active --> voided: void, before expires_at
+    active --> expired: expires_at passes (derived, no write)
+    captured --> [*]
+    voided --> [*]
+    expired --> [*]
+```
+
+`domain.HOLD_TRANSITIONS` holds the same table, and the property test checks
+every status change it observes against it. Only `active`, `captured` and
+`voided` are stored. Each stored status carries exactly the fields its
+transition sets, and `CHECK` constraints enforce the combinations:
+
+| Stored status | `closed_at` | `captured_amount` | Journal |
+| --- | --- | --- | --- |
+| `active` | null | null | nothing |
+| `captured` | the capture's `posted_at` | between 1 and `amount` | exactly one transaction with `hold_id` set |
+| `voided` | when it was voided | null | nothing |
+
+One constraint needed an explicit `captured_amount IS NOT NULL`: a `CHECK`
+rejects a row only when its expression is false, and `NULL > 0` is null, so
+without it a captured hold with no amount was accepted. A constraint test
+caught that before it shipped.
+
+**Capture** posts a transfer of `amount` (by default the whole hold) from the
+source to the destination as one journal transaction, and releases the rest.
+`transactions.hold_id` links the posting to its hold and is `UNIQUE`, so a
+hold reaches the journal at most once, the same way `UNIQUE (reverses_id)`
+limits reversals. The funds check on the capture leaves out the hold being
+captured, because its funds are the posting itself. If the holds fit the
+balance before, the capture always fits: the available balance after it is
+the available balance before plus the released remainder. A Hypothesis
+property in `test_domain.py` checks exactly that equation. A capture can be
+refunded by reversing its transaction; the hold stays `captured`.
+
+**Void** releases the whole hold and posts nothing.
+
+### Expiry is lazy
+
+An active hold whose `expires_at` has passed is reported as `expired`, stops
+counting toward `held_amount`, and can be neither captured nor voided
+(`409 hold-expired`). Nothing is written when that happens: the stored status
+stays `active`, and every query that sums holds also filters on
+`expires_at > now`.
+
+The alternative was explicit expiry: a background job that marks expired
+holds and releases their funds. I chose lazy expiry because:
+
+- the service is one process with synchronous request handling and no
+  scheduler, and lazy expiry needs none;
+- a hold stops counting exactly at `expires_at`, not whenever the job next
+  runs. With a sweeper, a hold would keep reducing the available balance
+  after expiry until the sweep, and capture would still have to check the
+  time to refuse a late capture, so the job would add nothing to correctness;
+- reads stay read-only.
+
+The costs: the raw `holds.status` column says `active` for an expired hold, so
+anything that reads the table directly must apply the same `expires_at` rule
+(the index on `(from_account_id, status, expires_at)` serves it); two reads a
+second apart can show different available balances with no write in between;
+and nothing fires at expiry. A system that must notify someone when a hold
+lapses would add a job that emits events, without changing these rules.
+
+`expires_at` is required: a hold that never lapsed would keep reducing the
+available balance if its caller forgot it. It must be later than the server's
+current time. There is no upper bound (section 14).
+
+**The clock is injectable.** `LedgerService(clock=...)` and
+`create_app(clock=...)` take a function that returns the current time, and
+every timestamp and expiry decision uses it. Tests pass a fake clock, so they
+check a hold one microsecond before its expiry (active, still capturable) and
+exactly at it (expired) instead of sleeping.
+
+**Point-in-time available balances.** Hold writes take their timestamp after
+reading the account rows, as postings do (section 9), and a capture's
+`closed_at` equals its transaction's `posted_at`. A hold counts as of time `T`
+when `created_at <= T < closed_at` (or it is still open) and `T < expires_at`,
+so `GET /v1/accounts/{id}/balance?as_of=T` reports the held and available
+balance at `T` next to the ledger balance.
+
+### Concurrency
+
+Holds reuse the optimistic scheme from section 7. Every write that can change
+an account's available balance goes through that account's compare-and-swap:
+
+- **Authorize** changes no balance, but it rewrites the source account's row
+  with the same balance and the next version. Concurrent holds and postings on
+  one account therefore serialize, and each decides with fresh data. Forty
+  concurrent 30-cent holds against 1,000 cents give exactly 33 holds and 7
+  refusals, on SQLite and on PostgreSQL. With the version bump removed,
+  PostgreSQL let 38 of the 40 through.
+- **Capture and void** race on the hold row. The transition is a guarded
+  `UPDATE holds SET status = ... WHERE id = ? AND status = 'active' AND
+  expires_at > ?`. Only one statement can match an active row; on PostgreSQL
+  the others wait for the winner's commit, re-check the `WHERE` clause and
+  match nothing. The loser rolls back, retries, sees the closed hold and
+  answers `409 hold-not-active`.
+- **Order of writes in a capture.** The capture swaps the account balances,
+  then closes the hold, then inserts the journal rows. Running the suite on
+  PostgreSQL showed why the order matters. At Read Committed each statement
+  sees what had committed when it started, so a capture can read the hold
+  before a rival capture commits and read the accounts after it. Its balance
+  compare-and-swap then passes. When the insert came first, the duplicate
+  posting hit `UNIQUE (hold_id)` and the client got a 500; closing the hold
+  first turns it into the retry above. A test reproduces the interleaving
+  deterministically. The same reasoning moved the "already reversed?" check
+  in reversals after the balance read, which fixed the same latent race there.
+- **Lock order.** Accounts in id order, then the hold row, in every write that
+  touches a hold. Voids rewrite the source account (version bump) before the
+  hold row, so no two writers wait on each other in a cycle.
+
+Voids bump the source version too. Releasing funds never makes anything
+unsafe, but without the bump a concurrent hold that counted the voided hold
+could be refused on stale data.
+
+All three hold writes need an `Idempotency-Key` and use the machinery from
+section 8. A replay returns the original response, even if the hold has since
+expired or been captured; `GET /v1/holds/{id}` shows the current state.
+
+**Compatibility.** Earlier responses stored under idempotency keys lack the
+new response fields (`held_amount`, `available_balance`, `captures_hold_id`).
+They replay unchanged because those fields default to what they meant before
+holds existed: no holds, and no capture. A test replays such records.
+
+### References for holds
+
+- [TigerBeetle: two-phase transfers](https://docs.tigerbeetle.com/coding/two-phase-transfers/)
+  (pending transfers that are later posted, possibly for less, or voided, and
+  that time out)
+- [Stripe: place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method)
+  (authorize now, capture all or part later, cancel to release)
+- [PostgreSQL: check constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS)
+  (a check constraint is satisfied when its expression is true or null)
+- [SQLite: making other kinds of table schema changes](https://www.sqlite.org/lang_altertable.html#otheralter)
+  and [Alembic: batch migrations for SQLite](https://alembic.sqlalchemy.org/en/latest/batch.html)
+
+## 11. Reconciliation
 
 `ledgerline reconcile` (`reconcile.py`) recomputes the invariants from the
 entries and exits 1 if any fails:
@@ -383,14 +569,28 @@ entries and exits 1 if any fails:
    account's own terms;
 2. every transaction's entries sum to zero per currency;
 3. every entry uses its account's currency;
-4. the trial balance (all entries per currency) is zero.
+4. the trial balance (all entries per currency) is zero;
+5. every hold's stored status, amounts and timestamps describe a path through
+   the hold state machine: captured never exceeds authorized, and a hold was
+   captured or voided at most once, after it was created and before it
+   expired (`reconcile.hold_problems`);
+6. active holds never exceed the ledger balance of an account that cannot go
+   negative (expiry judged at the time `reconcile` runs);
+7. every captured hold is in the journal exactly once, as a transaction that
+   moves exactly the captured amount from the source to the destination, in
+   the hold's currency, posted when the hold closed; and no transaction claims
+   to capture a hold that is not captured.
 
 Each check is a single SQL statement, so each sees a consistent snapshot even
 while the API writes. Tests tamper with the database directly (a changed
-balance, an unbalanced transaction, an entry in the wrong currency) and check
-that each is reported.
+balance, an unbalanced transaction, an entry in the wrong currency, a hold
+reserving more than the balance, a capture closed after expiry or moved off
+the journal, a capture with the wrong amount or time) and check that each is
+reported. The database constraints already refuse some broken holds (a
+captured amount above the authorized one, a stored `expired` status), so
+`hold_problems` is also tested directly on such rows.
 
-## 11. Errors, logging and authentication
+## 12. Errors, logging and authentication
 
 **Errors.** Each domain exception class carries its HTTP status, problem type
 and title (`errors.py`), and one handler turns any of them into an RFC 9457
@@ -414,7 +614,7 @@ key and each configured key are hashed with SHA-256 and compared with
 length, and every configured key is checked so timing does not reveal which
 one matched. With no keys configured every `/v1` request is rejected. Logs and
 idempotency records identify clients by a 16-hex-digit fingerprint of their key.
-This is enough for a single trusted caller; section 13 covers what real
+This is enough for a single trusted caller; section 14 covers what real
 deployments need.
 
 **Why SHA-256 and not a password hash.** Code scanners such as CodeQL flag
@@ -449,7 +649,7 @@ Any future change to the fingerprint must keep it stable across restarts and
 database recovery, or migrate the stored idempotency records along with it. A
 test pins the current derivation to a known value.
 
-## 12. Testing strategy
+## 13. Testing strategy
 
 | Layer | File | What it shows |
 | --- | --- | --- |
@@ -457,7 +657,10 @@ test pins the current derivation to a known value.
 | HTTP API | `test_api_*.py`, `test_idempotency.py`, `test_http.py` | Every endpoint, error type, header and status code |
 | State machine | `test_stateful.py` | Random operation sequences keep the invariants (below) |
 | Concurrency | `test_concurrency.py` | No lost updates or overdrafts under simultaneous writers; one effect per key; retries and their bound |
-| Schema | `test_migrations.py`, `test_storage.py` | `alembic upgrade head` matches the models and the API runs on it; storage details |
+| Holds, API | `test_api_holds.py` | Authorize, full and partial capture, void, expiry at its exact boundary, point-in-time available balances, idempotency, every hold error |
+| Holds, state machine | `test_holds_stateful.py` | Random hold sequences against an in-memory model (below) |
+| Holds, concurrency | `test_holds_concurrency.py` | Exactly the affordable set of concurrent holds succeeds; holds and transfers share one available balance; one capture or void wins; forced stale reads |
+| Schema | `test_migrations.py`, `test_storage.py` | `alembic upgrade head` matches the models, keeps an existing ledger's rows, downgrades and works offline; the hold constraints refuse broken rows |
 | Operations | `test_reconcile.py`, `test_cli.py`, `test_observability.py` | Reconciliation catches tampering; CLI exit codes; log format |
 
 The Hypothesis `RuleBasedStateMachine` keeps a model of every balance and
@@ -475,10 +678,28 @@ three ways (skipping one account's balance update, never storing idempotency
 records, and writing the pre-posting balance into `balance_after`); the test
 failed on each.
 
+The hold state machine test works the same way with its own model of
+accounts and holds and a fake clock that a rule moves forward, so holds expire
+mid-sequence. It predicts every response (status code, problem type, the
+hold's new state) and every ledger, held and available balance, checks that
+each hold's status only moves along an edge of `HOLD_TRANSITIONS`, and runs
+`reconcile` after every step. It also authorizes amounts near the whole
+available balance, where holds, captures and transfers compete for the last
+units. I broke the hold code nine ways and checked that tests fail: postings
+ignoring holds, sums of holds ignoring expiry, expiry one tick late, partial
+captures taking everything, a capture counting its own hold against itself,
+an unguarded state transition, reconcile skipping the capture legs, the
+migration keeping foreign keys enforced, and authorizations not bumping the
+account version. Each one failed at least one test. Run on its own, the
+state machine test caught the five that change what the API answers to
+sequential requests. The other four need a race, a tampered database or a
+migration to show; the targeted tests caught them, the version-bump mutant
+only on PostgreSQL, where the requests really race.
+
 The whole suite runs on SQLite by default and on PostgreSQL when
 `DATABASE_URL` points at a database whose name contains `test`.
 
-## 13. Out of scope
+## 14. Out of scope
 
 - **FX conversion.** Rates, rounding policy, quote expiry and the accounts for
   FX gains and losses are a product in themselves. The ledger already supports
@@ -498,11 +719,14 @@ The whole suite runs on SQLite by default and on PostgreSQL when
   learn about postings without dual writes. The usual fix is a transactional
   outbox: insert an event row in the same database transaction as the posting
   and publish it to a broker from a separate relay.
-- Also not built: pending or authorised-but-unsettled funds, backdated
-  entries, account closure, transaction search, rate limiting, metrics and
-  tracing export.
+- **More hold features.** One capture per hold (no incremental or multiple
+  partial captures), no increasing an existing hold, no listing of holds per
+  account, no maximum hold duration, and no pending credits on the
+  destination side. Each is an extension of the same state machine.
+- Also not built: backdated entries, account closure, transaction search,
+  rate limiting, metrics and tracing export.
 
-## 14. Questions worth being ready for
+## 15. Questions worth being ready for
 
 **Why not store amounts as floats or decimals?** Floats cannot represent most
 decimal fractions exactly. Decimals would work, but integers of minor units
@@ -539,6 +763,25 @@ accounts. Those movements are explicit journal transactions.
 shared lock and then needs to upgrade to a write lock; two such transactions
 deadlock, and SQLite reports that as "database is locked". Taking the write
 lock up front makes writers queue instead.
+
+**Why does a hold not post anything until it is captured?** The journal
+records what happened; an authorization is a promise that may still be
+voided or expire. Keeping it out of the journal means the ledger balance and
+the statements show only settled money, while the available balance shows what
+is free to spend.
+
+**What stops a transfer from spending money a hold reserved?** Every posting
+checks the available balance, not the ledger balance, and every write that
+changes either goes through the source account's compare-and-swap.
+
+**A capture and a void arrive at the same time. What happens?** Both read the
+hold as active. The guarded `UPDATE ... WHERE status = 'active'` lets exactly
+one of them move it; the other rolls back, retries, sees the closed hold and
+gets `409 hold-not-active`.
+
+**Why lazy expiry instead of a job?** It needs no scheduler, a hold stops
+counting exactly at `expires_at`, and reads never write. Section 10 lists what
+it costs.
 
 **How would you scale it?** PostgreSQL first: connection pooling, read replicas
 for statements and history, and partitioning the `entries` table by time. Then

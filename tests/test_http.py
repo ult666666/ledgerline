@@ -11,6 +11,7 @@ from sqlalchemy import Engine
 
 from ledgerline.api.app import create_app
 from ledgerline.api.auth import authenticate_api_key, key_fingerprint
+from ledgerline.api.problems import problem_response
 from ledgerline.config import Settings
 from ledgerline.errors import ConcurrentUpdate
 from tests.support import API_KEY, problem_type
@@ -174,3 +175,10 @@ class TestRequestIds:
     def test_problem_bodies_carry_the_request_id(self, client: TestClient) -> None:
         response = client.get("/v1/nothing-here", headers={"X-Request-ID": "req-42"})
         assert response.json()["request_id"] == "req-42"
+
+
+@pytest.mark.parametrize("member", ["type", "title", "status", "detail", "instance", "request_id"])
+def test_extensions_cannot_overwrite_standard_problem_members(member: str) -> None:
+    # {"status": "captured"} once replaced the HTTP status code in a hold problem.
+    with pytest.raises(ValueError, match=member):
+        problem_response(409, "Conflict", extensions={member: "something else"})

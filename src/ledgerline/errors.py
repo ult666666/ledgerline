@@ -5,8 +5,14 @@ maps to, so the API layer can translate every failure the same way instead of
 growing an if/elif chain.
 """
 
+from datetime import UTC, datetime
 from typing import ClassVar
 from uuid import UUID
+
+
+def timestamp(value: datetime) -> str:
+    """ISO 8601 in UTC with a ``Z`` suffix, the format response bodies use."""
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 class LedgerError(Exception):
@@ -59,6 +65,11 @@ class TransactionNotFound(NotFound):
         )
 
 
+class HoldNotFound(NotFound):
+    def __init__(self, hold_id: UUID) -> None:
+        super().__init__(f"hold {hold_id} does not exist", hold_id=str(hold_id))
+
+
 class InvalidTransaction(LedgerError):
     status_code = 422
     problem_type = "invalid-transaction"
@@ -81,13 +92,60 @@ class InsufficientFunds(LedgerError):
     problem_type = "insufficient-funds"
     title = "Insufficient funds"
 
-    def __init__(self, account_id: UUID, *, balance: int, change: int) -> None:
+    def __init__(self, account_id: UUID, *, balance: int, change: int, held: int = 0) -> None:
+        available = balance - held
+        if held:
+            detail = (
+                f"account {account_id} has a balance of {balance}, of which {held} is reserved "
+                f"by active holds, so {available} is available; it does not allow the "
+                f"available balance to go below zero and the requested change was {change}"
+            )
+        else:
+            detail = (
+                f"account {account_id} has a balance of {balance} and does not allow it to go "
+                f"below zero; the requested change was {change}"
+            )
         super().__init__(
-            f"account {account_id} has a balance of {balance} and does not allow it to go "
-            f"below zero; the requested change was {change}",
+            detail,
             account_id=str(account_id),
             balance=balance,
+            held_amount=held,
+            available_balance=available,
             change=change,
+        )
+
+
+class InvalidHold(LedgerError):
+    status_code = 422
+    problem_type = "invalid-hold"
+    title = "Invalid hold"
+
+
+class HoldNotActive(LedgerError):
+    status_code = 409
+    problem_type = "hold-not-active"
+    title = "Hold is no longer active"
+
+    def __init__(self, hold_id: UUID, status: str) -> None:
+        super().__init__(
+            f"hold {hold_id} is already {status}; only an active hold can be captured or voided",
+            hold_id=str(hold_id),
+            hold_status=str(status),
+        )
+
+
+class HoldExpired(LedgerError):
+    status_code = 409
+    problem_type = "hold-expired"
+    title = "Hold expired"
+
+    def __init__(self, hold_id: UUID, expires_at: datetime) -> None:
+        super().__init__(
+            f"hold {hold_id} expired at {timestamp(expires_at)}; its funds are available "
+            "again, so authorize a new hold to take them",
+            hold_id=str(hold_id),
+            hold_status="expired",
+            expires_at=timestamp(expires_at),
         )
 
 

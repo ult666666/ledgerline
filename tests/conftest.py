@@ -19,7 +19,7 @@ from ledgerline.config import Settings
 from ledgerline.db import create_db_engine, create_session_factory
 from ledgerline.models import Base
 from ledgerline.service import LedgerService
-from tests.support import API_KEY
+from tests.support import API_KEY, FakeClock
 
 
 @pytest.fixture(scope="session")
@@ -79,5 +79,18 @@ def app(settings: Settings, db: Engine) -> FastAPI:
 
 @pytest.fixture
 def client(app: FastAPI) -> Iterator[TestClient]:
+    with TestClient(app, headers={"Authorization": f"Bearer {API_KEY}"}) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def clocked_client(settings: Settings, db: Engine, clock: FakeClock) -> Iterator[TestClient]:
+    """A client whose server takes every timestamp and expiry decision from ``clock``."""
+    app = create_app(settings, engine=db, clock=clock)
     with TestClient(app, headers={"Authorization": f"Bearer {API_KEY}"}) as test_client:
         yield test_client

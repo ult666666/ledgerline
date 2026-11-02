@@ -8,11 +8,12 @@ from collections.abc import Collection
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import ColumnElement, ScalarSelect, and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import InstrumentedAttribute, Session, joinedload, selectinload
 
-from ledgerline.models import Account, Entry, IdempotencyRecord, Transaction
+from ledgerline.domain import HoldStatus
+from ledgerline.models import Account, Entry, Hold, IdempotencyRecord, Transaction
 from ledgerline.pagination import AccountCursor
 
 
@@ -40,8 +41,28 @@ class LedgerRepository:
         accounts = self.session.scalars(select(Account).where(Account.id.in_(account_ids)))
         return {account.id: account for account in accounts}
 
-    def list_accounts(self, *, limit: int, after: AccountCursor | None) -> list[Account]:
-        query = select(Account).order_by(Account.created_at, Account.id).limit(limit)
+    def get_account_with_held(
+        self, account_id: UUID, *, now: datetime
+    ) -> tuple[Account, int] | None:
+        """An account and the total of its active holds, read in one statement.
+
+        One statement means one snapshot, so a capture committing in between
+        cannot pair the old balance with the new (smaller) held amount.
+        """
+        row = self.session.execute(
+            select(Account, _held_now(Account.id, now)).where(Account.id == account_id)
+        ).first()
+        return None if row is None else (row[0], int(row[1]))
+
+    def list_accounts(
+        self, *, limit: int, after: AccountCursor | None, now: datetime
+    ) -> list[tuple[Account, int]]:
+        """A page of accounts, each with the total of its active holds."""
+        query = (
+            select(Account, _held_now(Account.id, now))
+            .order_by(Account.created_at, Account.id)
+            .limit(limit)
+        )
         if after is not None:
             query = query.where(
                 or_(
@@ -49,7 +70,7 @@ class LedgerRepository:
                     and_(Account.created_at == after.created_at, Account.id > after.id),
                 )
             )
-        return list(self.session.scalars(query))
+        return [(account, int(held)) for account, held in self.session.execute(query)]
 
     def compare_and_set_balance(
         self, account_id: UUID, *, expected_version: int, new_balance: int
@@ -106,6 +127,72 @@ class LedgerRepository:
             select(Transaction.id).where(Transaction.reverses_id == transaction_id)
         )
 
+    def find_capture_id(self, hold_id: UUID) -> UUID | None:
+        return self.session.scalar(select(Transaction.id).where(Transaction.hold_id == hold_id))
+
+    # Holds
+
+    def add_hold(self, hold: Hold) -> None:
+        self.session.add(hold)
+        self.session.flush()
+
+    def get_hold(self, hold_id: UUID) -> Hold | None:
+        return self.session.get(Hold, hold_id)
+
+    def held_amounts(
+        self, account_ids: Collection[UUID], *, now: datetime, excluding: UUID | None = None
+    ) -> dict[UUID, int]:
+        """Total of the active, unexpired holds on each account, as the source.
+
+        ``excluding`` leaves out the hold that a capture is about to consume.
+        Accounts without holds are missing from the result.
+        """
+        query = (
+            select(Hold.from_account_id, func.sum(Hold.amount))
+            .where(Hold.from_account_id.in_(account_ids), _active_at(now))
+            .group_by(Hold.from_account_id)
+        )
+        if excluding is not None:
+            query = query.where(Hold.id != excluding)
+        return {account_id: int(total) for account_id, total in self.session.execute(query)}
+
+    def sum_holds(self, account_id: UUID, *, active_at: datetime) -> int:
+        """Total of the holds on an account that were active at a point in time.
+
+        Uses the timestamps rather than the stored status, so it also answers
+        for the past: a hold counts from created_at until it was captured or
+        voided (closed_at) or it expired, whichever came first.
+        """
+        total = self.session.scalar(
+            select(func.coalesce(func.sum(Hold.amount), 0)).where(
+                Hold.from_account_id == account_id,
+                Hold.created_at <= active_at,
+                or_(Hold.closed_at.is_(None), Hold.closed_at > active_at),
+                Hold.expires_at > active_at,
+            )
+        )
+        return int(total or 0)
+
+    def close_hold(
+        self, hold: Hold, *, status: HoldStatus, at: datetime, captured_amount: int | None = None
+    ) -> bool:
+        """Move an active, unexpired hold to captured or voided.
+
+        The WHERE clause makes the transition itself the arbiter between
+        racing captures and voids: only one UPDATE can match an active row
+        (on PostgreSQL the others wait, re-check the clause and match nothing).
+        Returns False if the hold was no longer active.
+        """
+        result = self.session.connection().execute(
+            update(Hold)
+            .where(Hold.id == hold.id, Hold.status == HoldStatus.ACTIVE, Hold.expires_at > at)
+            .values(status=status, closed_at=at, captured_amount=captured_amount)
+        )
+        if result.rowcount != 1:
+            return False
+        self.session.refresh(hold)
+        return True
+
     # Idempotency keys
 
     def get_idempotency_record(self, principal: str, key: str) -> IdempotencyRecord | None:
@@ -119,3 +206,16 @@ class LedgerRepository:
             # The primary key (principal, key) is the arbiter between concurrent
             # requests that both found no record when they started.
             raise DuplicateIdempotencyKey from exc
+
+
+def _active_at(now: datetime) -> ColumnElement[bool]:
+    return and_(Hold.status == HoldStatus.ACTIVE, Hold.expires_at > now)
+
+
+def _held_now(account_id: InstrumentedAttribute[UUID], now: datetime) -> ScalarSelect[int]:
+    """Correlated subquery: the total of an account's active, unexpired holds."""
+    return (
+        select(func.coalesce(func.sum(Hold.amount), 0))
+        .where(Hold.from_account_id == account_id, _active_at(now))
+        .scalar_subquery()
+    )

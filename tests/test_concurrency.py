@@ -16,12 +16,12 @@ from sqlalchemy.orm import Session
 
 from ledgerline.db import create_session_factory
 from ledgerline.domain import AccountType
-from ledgerline.errors import ConcurrentUpdate, InsufficientFunds
+from ledgerline.errors import AlreadyReversed, ConcurrentUpdate, InsufficientFunds
 from ledgerline.idempotency import IdempotencyRequest, request_fingerprint
-from ledgerline.models import Transaction
+from ledgerline.models import Account, Transaction
 from ledgerline.reconcile import reconcile
 from ledgerline.repository import LedgerRepository
-from ledgerline.schemas import AccountCreate, TransferCreate
+from ledgerline.schemas import AccountCreate, ReversalCreate, TransferCreate
 from ledgerline.service import LedgerService
 
 
@@ -210,3 +210,38 @@ def test_losing_the_idempotency_key_race_rolls_back_and_replays(
     assert second.body == first.body
     assert service.get_account(source).balance == 900
     assert_reconciles(db)
+
+
+def test_a_rival_reversal_that_commits_before_the_balances_are_read_is_seen(
+    service: LedgerService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, destination = funded_wallets(service, 1_000)
+    body = transfer_request(source, destination, 100)
+    original = service.transfer(body, idempotency(body)).body
+
+    # On PostgreSQL (Read Committed) a rival reversal can commit after this
+    # request looked for an existing reversal but before it read the balances.
+    # The balance compare-and-swap then passes, so the existing-reversal check
+    # has to come after the balance read. Simulated here by writing the rival
+    # inside the request's own transaction, just before the balances are read.
+    real_get_accounts = LedgerRepository.get_accounts
+    rival_id = uuid4()
+
+    def rival_commits_first(repo: LedgerRepository, account_ids: object) -> dict[UUID, Account]:
+        if repo.session.get(Transaction, rival_id) is None:
+            repo.session.add(
+                Transaction(
+                    id=rival_id,
+                    description="rival reversal",
+                    metadata_={},
+                    posted_at=original.posted_at,
+                    reverses_id=original.id,
+                )
+            )
+            repo.session.flush()
+        return real_get_accounts(repo, account_ids)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(LedgerRepository, "get_accounts", rival_commits_first)
+    request = IdempotencyRequest(principal="test-client", key=str(uuid4()), fingerprint="0" * 64)
+    with pytest.raises(AlreadyReversed):
+        service.reverse_transaction(original.id, ReversalCreate(), request)
