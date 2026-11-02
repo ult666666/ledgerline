@@ -12,17 +12,23 @@ from ledgerline.api.auth import MIN_KEY_LENGTH, short_key_count
 from ledgerline.api.dependencies import authenticate
 from ledgerline.api.middleware import RequestContextMiddleware
 from ledgerline.api.problems import install_problem_handlers
-from ledgerline.api.routes import accounts, health, transactions
+from ledgerline.api.routes import accounts, health, holds, transactions
 from ledgerline.config import Settings
 from ledgerline.db import create_db_engine, create_session_factory
 from ledgerline.observability import configure_logging
-from ledgerline.service import LedgerService
+from ledgerline.service import Clock, LedgerService, utc_now
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(settings: Settings | None = None, *, engine: Engine | None = None) -> FastAPI:
-    """Build the API. Pass ``engine`` to share one (e.g. in tests); the caller then owns it."""
+def create_app(
+    settings: Settings | None = None, *, engine: Engine | None = None, clock: Clock = utc_now
+) -> FastAPI:
+    """Build the API.
+
+    Pass ``engine`` to share one (e.g. in tests); the caller then owns it. ``clock``
+    supplies every timestamp and every expiry decision; tests pass a fake one.
+    """
     settings = settings or Settings()
     configure_logging(settings.log_level)
     owns_engine = engine is None
@@ -53,13 +59,14 @@ def create_app(settings: Settings | None = None, *, engine: Engine | None = None
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.service = LedgerService(create_session_factory(db_engine))
+    app.state.service = LedgerService(create_session_factory(db_engine), clock=clock)
     app.add_middleware(RequestContextMiddleware)
     install_problem_handlers(app)
 
     v1 = APIRouter(prefix="/v1", dependencies=[Depends(authenticate)])
     v1.include_router(accounts.router)
     v1.include_router(transactions.router)
+    v1.include_router(holds.router)
     app.include_router(health.router)
     app.include_router(v1)
     return app

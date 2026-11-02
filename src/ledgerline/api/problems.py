@@ -14,6 +14,10 @@ from ledgerline.observability import request_id_var
 PROBLEM_CONTENT_TYPE = "application/problem+json"
 # Each problem type URI points at its entry in the error catalogue.
 PROBLEM_TYPE_BASE = "https://github.com/ult666666/ledgerline/blob/main/docs/errors.md#"
+# Members RFC 9457 defines (section 3.1) plus the request ID this service adds.
+# An extension may not reuse these names: {"status": "captured"} would replace
+# the HTTP status code that clients read from the body.
+RESERVED_MEMBERS = frozenset({"type", "title", "status", "detail", "instance", "request_id"})
 
 
 def problem_response(
@@ -32,6 +36,8 @@ def problem_response(
     }
     if detail is not None:
         body["detail"] = detail
+    if clashing := RESERVED_MEMBERS.intersection(extensions or {}):
+        raise ValueError(f"problem extensions may not redefine {sorted(clashing)}")
     body.update(extensions or {})
     request_id = request_id_var.get()
     if request_id is not None:

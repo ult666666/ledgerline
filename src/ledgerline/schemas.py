@@ -5,12 +5,20 @@ the accounting rules that span several fields live in ledgerline.domain.
 """
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    model_validator,
+)
 
-from ledgerline.domain import MAX_MAGNITUDE, AccountType, NormalBalance
+from ledgerline.domain import MAX_MAGNITUDE, AccountType, HoldStatus, NormalBalance
 
 MAX_ENTRIES_PER_TRANSACTION = 100
 
@@ -90,6 +98,34 @@ class ReversalCreate(RequestModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class HoldCreate(RequestModel):
+    from_account_id: UUID
+    to_account_id: UUID
+    amount: PositiveAmount
+    currency: Currency
+    expires_at: AwareDatetime = Field(
+        description="When the hold lapses if it is not captured or voided first. ISO 8601 "
+        "with a timezone, later than the current time.",
+        examples=["2026-11-08T12:00:00Z"],
+    )
+    description: Description | None = None
+    metadata: Metadata = Field(default_factory=dict)
+
+
+class HoldCapture(RequestModel):
+    amount: PositiveAmount | None = Field(
+        default=None,
+        description="How much to capture; defaults to the whole hold. Any remainder is released.",
+    )
+    description: Description | None = None
+    metadata: Metadata = Field(default_factory=dict)
+
+
+_BALANCE = "Ledger balance: posted entries only, in the account's normal-balance terms."
+_HELD = "Total of the account's active holds (funds reserved for later transfers)."
+_AVAILABLE = "balance minus held_amount: what the account can spend or hold right now."
+
+
 class AccountOut(BaseModel):
     id: UUID
     name: str
@@ -97,17 +133,51 @@ class AccountOut(BaseModel):
     currency: str
     normal_balance: NormalBalance
     allow_negative: bool
-    balance: int = Field(description="Current balance in the account's normal-balance terms.")
+    balance: int = Field(description=_BALANCE)
+    held_amount: int = Field(description=_HELD)
+    available_balance: int = Field(description=_AVAILABLE)
     metadata: dict[str, str]
     created_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_fields_added_with_holds(cls, data: Any) -> Any:
+        # Responses stored under an Idempotency-Key before holds existed (0.1.0)
+        # lack these fields. Such an account had no holds, so they follow from
+        # the balance; a replay of that response must still validate.
+        if isinstance(data, dict) and "held_amount" not in data and "balance" in data:
+            return {**data, "held_amount": 0, "available_balance": data["balance"]}
+        return data
 
 
 class BalanceOut(BaseModel):
     account_id: UUID
     currency: str
     normal_balance: NormalBalance
-    balance: int
+    balance: int = Field(description=_BALANCE)
+    held_amount: int = Field(description=_HELD)
+    available_balance: int = Field(description=_AVAILABLE)
     as_of: datetime | None = Field(description="The point in time requested, or null for now.")
+
+
+class HoldOut(BaseModel):
+    id: UUID
+    status: HoldStatus = Field(
+        description="active, captured, voided or expired (an active hold past its expires_at)."
+    )
+    from_account_id: UUID
+    to_account_id: UUID
+    amount: int = Field(description="The authorized amount.")
+    captured_amount: int | None = Field(description="Set once the hold is captured.")
+    currency: str
+    description: str | None
+    metadata: dict[str, str]
+    created_at: datetime
+    expires_at: datetime
+    closed_at: datetime | None = Field(description="When the hold was captured or voided.")
+    capture_transaction_id: UUID | None = Field(
+        description="The journal transaction the capture posted."
+    )
 
 
 class EntryOut(BaseModel):
@@ -123,6 +193,11 @@ class TransactionOut(BaseModel):
     posted_at: datetime
     reverses_transaction_id: UUID | None
     reversed_by_transaction_id: UUID | None
+    # A default, because responses stored under an Idempotency-Key before holds
+    # existed (0.1.0) lack the field and must still replay.
+    captures_hold_id: UUID | None = Field(
+        default=None, description="The hold this transaction captured, if any."
+    )
     entries: list[EntryOut]
 
 

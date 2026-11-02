@@ -1,5 +1,6 @@
-"""Unit tests for the pure double-entry rules in ledgerline.domain."""
+"""Unit tests for the pure double-entry and hold rules in ledgerline.domain."""
 
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -7,25 +8,40 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from ledgerline.domain import (
+    HOLD_TRANSITIONS,
     MAX_MAGNITUDE,
+    STORED_HOLD_STATUSES,
     AccountState,
     AccountType,
     EntryDraft,
+    HoldState,
+    HoldStatus,
     NormalBalance,
     apply_entries,
     balance_change,
+    capture_amount,
     check_currencies,
+    check_hold_request,
     default_normal_balance,
+    hold_status,
+    require_active,
     reversal_entries,
     transfer_entries,
     validate_entries,
 )
 from ledgerline.errors import (
+    HoldExpired,
+    HoldNotActive,
     InsufficientFunds,
+    InvalidHold,
     InvalidTransaction,
     InvalidTransfer,
     UnbalancedTransaction,
 )
+
+NOW = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+LATER = NOW + timedelta(hours=1)
+TICK = timedelta(microseconds=1)
 
 
 def account(
@@ -34,6 +50,7 @@ def account(
     balance: int = 0,
     allow_negative: bool = False,
     currency: str = "USD",
+    held: int = 0,
 ) -> AccountState:
     return AccountState(
         id=uuid4(),
@@ -42,7 +59,12 @@ def account(
         allow_negative=allow_negative,
         balance=balance,
         version=0,
+        held=held,
     )
+
+
+def hold(status: HoldStatus = HoldStatus.ACTIVE, amount: int = 1_000) -> HoldState:
+    return HoldState(id=uuid4(), status=status, amount=amount, expires_at=LATER)
 
 
 def draft(account_id: UUID, amount: int, currency: str = "USD") -> EntryDraft:
@@ -152,6 +174,8 @@ class TestApplyEntries:
         assert caught.value.extensions == {
             "account_id": str(wallet.id),
             "balance": 100,
+            "held_amount": 0,
+            "available_balance": 100,
             "change": -101,
         }
 
@@ -264,3 +288,135 @@ def test_any_balanced_posting_validates_and_its_reversal_cancels_it(amounts: lis
     }
     restored = apply_entries(reversal_entries(entries), moved)
     assert all(value == 0 for value in restored.values())
+
+
+class TestApplyEntriesWithHolds:
+    def test_postings_cannot_spend_held_funds(self) -> None:
+        wallet = account(normal_balance=NormalBalance.CREDIT, balance=1_000, held=600)
+        other = account(normal_balance=NormalBalance.CREDIT)
+        accounts = {wallet.id: wallet, other.id: other}
+        assert apply_entries(transfer_entries(wallet, other, 400, "USD"), accounts) == {
+            wallet.id: 600,
+            other.id: 400,
+        }
+        with pytest.raises(InsufficientFunds) as caught:
+            apply_entries(transfer_entries(wallet, other, 401, "USD"), accounts)
+        assert caught.value.extensions == {
+            "account_id": str(wallet.id),
+            "balance": 1_000,
+            "held_amount": 600,
+            "available_balance": 400,
+            "change": -401,
+        }
+        assert "of which 600 is reserved by active holds" in caught.value.detail
+
+    def test_money_coming_in_is_never_refused_because_of_holds(self) -> None:
+        fully_held = account(normal_balance=NormalBalance.CREDIT, balance=500, held=500)
+        funding = account(normal_balance=NormalBalance.CREDIT, allow_negative=True)
+        new = apply_entries(
+            transfer_entries(funding, fully_held, 1, "USD"),
+            {fully_held.id: fully_held, funding.id: funding},
+        )
+        assert new[fully_held.id] == 501
+
+
+class TestHoldRules:
+    def test_an_active_hold_expires_at_its_expires_at(self) -> None:
+        assert hold_status(HoldStatus.ACTIVE, LATER, LATER - TICK) is HoldStatus.ACTIVE
+        assert hold_status(HoldStatus.ACTIVE, LATER, LATER) is HoldStatus.EXPIRED
+        assert hold_status(HoldStatus.ACTIVE, LATER, LATER + timedelta(days=9)) is (
+            HoldStatus.EXPIRED
+        )
+
+    @pytest.mark.parametrize("final", [HoldStatus.CAPTURED, HoldStatus.VOIDED])
+    def test_captured_and_voided_holds_never_expire(self, final: HoldStatus) -> None:
+        assert hold_status(final, LATER, LATER + timedelta(days=9)) is final
+
+    def test_the_state_machine_has_one_start_state_and_three_final_ones(self) -> None:
+        assert HOLD_TRANSITIONS[HoldStatus.ACTIVE] == {
+            HoldStatus.CAPTURED,
+            HoldStatus.VOIDED,
+            HoldStatus.EXPIRED,
+        }
+        for final in (HoldStatus.CAPTURED, HoldStatus.VOIDED, HoldStatus.EXPIRED):
+            assert HOLD_TRANSITIONS[final] == frozenset()
+        # Expiry is derived when a hold is read, so it is never a stored state.
+        assert set(STORED_HOLD_STATUSES) == set(HoldStatus) - {HoldStatus.EXPIRED}
+
+    def test_only_an_active_unexpired_hold_can_be_captured_or_voided(self) -> None:
+        require_active(hold(), LATER - TICK)
+        with pytest.raises(HoldExpired) as expired:
+            require_active(hold(), LATER)
+        assert expired.value.extensions["hold_status"] == "expired"
+        for final in (HoldStatus.CAPTURED, HoldStatus.VOIDED):
+            with pytest.raises(HoldNotActive) as closed:
+                require_active(hold(final), NOW)
+            assert closed.value.extensions["hold_status"] == final
+
+    def test_a_capture_takes_the_whole_hold_by_default_and_never_more(self) -> None:
+        authorized = hold(amount=1_000)
+        assert capture_amount(authorized, None) == 1_000
+        assert capture_amount(authorized, 1) == 1
+        assert capture_amount(authorized, 1_000) == 1_000
+        for too_much in (1_001, MAX_MAGNITUDE):
+            with pytest.raises(InvalidHold, match="authorized only 1000"):
+                capture_amount(authorized, too_much)
+        with pytest.raises(InvalidHold, match="positive"):
+            capture_amount(authorized, 0)
+
+    def test_a_hold_needs_the_amount_to_be_available(self) -> None:
+        source = account(normal_balance=NormalBalance.CREDIT, balance=1_000, held=600)
+        destination = account(normal_balance=NormalBalance.CREDIT)
+        check_hold_request(source, destination, 400, "USD", expires_at=LATER, now=NOW)
+        with pytest.raises(InsufficientFunds) as caught:
+            check_hold_request(source, destination, 401, "USD", expires_at=LATER, now=NOW)
+        assert caught.value.extensions["available_balance"] == 400
+
+    def test_an_account_that_may_go_negative_can_hold_beyond_its_balance(self) -> None:
+        source = account(normal_balance=NormalBalance.CREDIT, allow_negative=True, held=5_000)
+        destination = account(normal_balance=NormalBalance.CREDIT)
+        check_hold_request(source, destination, 10_000, "USD", expires_at=LATER, now=NOW)
+
+    def test_a_hold_follows_the_transfer_rules(self) -> None:
+        wallet = account(normal_balance=NormalBalance.CREDIT, balance=1_000)
+        with pytest.raises(InvalidTransfer, match="must be different"):
+            check_hold_request(wallet, wallet, 1, "USD", expires_at=LATER, now=NOW)
+        with pytest.raises(InvalidTransfer, match="normal balance"):
+            check_hold_request(wallet, account(), 1, "USD", expires_at=LATER, now=NOW)
+        euros = account(normal_balance=NormalBalance.CREDIT, currency="EUR")
+        with pytest.raises(InvalidTransaction, match="does not match account"):
+            check_hold_request(wallet, euros, 1, "USD", expires_at=LATER, now=NOW)
+
+    @pytest.mark.parametrize("expires_at", [NOW, NOW - TICK])
+    def test_a_hold_must_expire_in_the_future(self, expires_at: datetime) -> None:
+        source = account(normal_balance=NormalBalance.CREDIT, balance=1_000)
+        destination = account(normal_balance=NormalBalance.CREDIT)
+        with pytest.raises(InvalidHold, match="must be later than"):
+            check_hold_request(source, destination, 1, "USD", expires_at=expires_at, now=NOW)
+
+
+@given(
+    hold_amount=st.integers(min_value=1, max_value=10**9),
+    other_holds=st.integers(min_value=0, max_value=10**9),
+    slack=st.integers(min_value=0, max_value=10**9),
+    data=st.data(),
+)
+def test_capturing_any_part_of_a_hold_fits_and_never_lowers_the_available_balance(
+    hold_amount: int, other_holds: int, slack: int, data: st.DataObject
+) -> None:
+    # Before the capture the source's holds fit within its balance, as the service
+    # guarantees. The capture posts `captured` and releases the rest of its hold,
+    # so the funds check on the posting can never fail.
+    balance = other_holds + hold_amount + slack
+    captured = data.draw(st.integers(min_value=1, max_value=hold_amount))
+    side = data.draw(st.sampled_from(NormalBalance))
+    source = account(normal_balance=side, balance=balance, held=other_holds)
+    destination = account(normal_balance=side)
+    new = apply_entries(
+        transfer_entries(source, destination, captured, "USD"),
+        {source.id: source, destination.id: destination},
+    )
+    available_before = balance - other_holds - hold_amount
+    available_after = new[source.id] - other_holds
+    assert available_after == available_before + (hold_amount - captured) >= available_before >= 0
+    assert new[destination.id] == captured

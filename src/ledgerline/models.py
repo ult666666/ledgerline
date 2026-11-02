@@ -2,8 +2,9 @@
 
 The constraints here are a second line of defence behind the service layer:
 even a buggy code path cannot store a zero-amount entry, list the same account
-twice in one transaction, reverse a transaction twice or overdraw an account
-that does not allow negative balances.
+twice in one transaction, reverse a transaction twice, overdraw an account
+that does not allow negative balances, capture more than a hold authorized or
+post one hold's capture twice.
 """
 
 import uuid
@@ -27,7 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from ledgerline.domain import AccountType, NormalBalance
+from ledgerline.domain import STORED_HOLD_STATUSES, AccountType, NormalBalance
 
 # Deterministic constraint names keep Alembic migrations stable across databases.
 NAMING_CONVENTION = {
@@ -117,6 +118,55 @@ class Account(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime)
 
 
+_STORED_STATUSES_SQL = ", ".join(f"'{status}'" for status in STORED_HOLD_STATUSES)
+
+
+class Hold(Base):
+    """Funds reserved on one account for a later transfer to another (a two-phase transfer).
+
+    Authorizing a hold posts nothing. While the hold is active and unexpired it
+    lowers the source account's available balance; capturing it posts a journal
+    transaction (linked through ``transactions.hold_id``) and voiding it releases
+    the funds. Only active, captured and voided are stored: expiry is derived
+    from ``expires_at`` when the hold is read.
+    """
+
+    __tablename__ = "holds"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint("from_account_id <> to_account_id", name="distinct_accounts"),
+        CheckConstraint(f"status IN ({_STORED_STATUSES_SQL})", name="status_stored"),
+        # Each stored status carries exactly the fields its transition sets, and a
+        # capture never takes more than the hold authorized. The explicit IS NOT
+        # NULL matters: a CHECK only rejects FALSE, and "NULL > 0" is NULL.
+        CheckConstraint(
+            "(status = 'active' AND closed_at IS NULL AND captured_amount IS NULL)"
+            " OR (status = 'captured' AND closed_at IS NOT NULL AND captured_amount IS NOT NULL"
+            " AND captured_amount > 0 AND captured_amount <= amount)"
+            " OR (status = 'voided' AND closed_at IS NOT NULL AND captured_amount IS NULL)",
+            name="status_fields",
+        ),
+        # Available balances sum an account's active holds.
+        Index(None, "from_account_id", "status", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    from_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
+    to_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
+    # The authorized amount, in the accounts' minor units.
+    amount: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    # A HoldStatus value: active, captured or voided.
+    status: Mapped[str] = mapped_column(String(8))
+    captured_amount: Mapped[int | None] = mapped_column(BigInteger)
+    description: Mapped[str | None] = mapped_column(String(500))
+    metadata_: Mapped[dict[str, str]] = mapped_column("metadata", JSON)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    # When the hold was captured or voided; null while it is active (or expired).
+    closed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+
 class Transaction(Base):
     """An immutable journal transaction. Corrections are new (reversal) transactions."""
 
@@ -130,6 +180,9 @@ class Transaction(Base):
     reverses_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transactions.id"), unique=True
     )
+    # Set on the transaction a capture posts. UNIQUE: a hold reaches the journal
+    # at most once, however many times its capture is attempted.
+    hold_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("holds.id"), unique=True)
 
     entries: Mapped[list["Entry"]] = relationship(back_populates="transaction", order_by="Entry.id")
 

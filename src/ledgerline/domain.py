@@ -9,19 +9,29 @@ Balances are reported in each account's own terms ("normal balance"): an asset
 account holding $100 has balance 10000, and so does a customer wallet (a
 liability) that owes the customer $100, even though the first was built from
 debits and the second from credits.
+
+A hold reserves part of an account's balance for a later transfer (a two-phase
+transfer). The *ledger balance* counts posted entries only; the *available
+balance* is the ledger balance minus the account's active holds, and it is what
+an account that may not go negative is allowed to spend.
 """
 
 import enum
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from ledgerline.errors import (
+    HoldExpired,
+    HoldNotActive,
     InsufficientFunds,
+    InvalidHold,
     InvalidTransaction,
     InvalidTransfer,
     UnbalancedTransaction,
+    timestamp,
 )
 
 # JavaScript clients parse JSON numbers as IEEE-754 doubles, which represent
@@ -64,6 +74,31 @@ class EntryDraft:
     currency: str
 
 
+class HoldStatus(enum.StrEnum):
+    """A hold's state as the API reports it.
+
+    Only ``active``, ``captured`` and ``voided`` are ever stored. Expiry is lazy:
+    an active hold whose ``expires_at`` has passed is reported as ``expired`` and
+    stops counting against the available balance, without any write.
+    """
+
+    ACTIVE = "active"
+    CAPTURED = "captured"
+    VOIDED = "voided"
+    EXPIRED = "expired"
+
+
+STORED_HOLD_STATUSES = (HoldStatus.ACTIVE, HoldStatus.CAPTURED, HoldStatus.VOIDED)
+
+# The hold state machine. Every hold starts active; the other states are final.
+HOLD_TRANSITIONS: Mapping[HoldStatus, frozenset[HoldStatus]] = {
+    HoldStatus.ACTIVE: frozenset({HoldStatus.CAPTURED, HoldStatus.VOIDED, HoldStatus.EXPIRED}),
+    HoldStatus.CAPTURED: frozenset(),
+    HoldStatus.VOIDED: frozenset(),
+    HoldStatus.EXPIRED: frozenset(),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class AccountState:
     """What the posting rules need to know about an account, detached from the ORM."""
@@ -74,6 +109,23 @@ class AccountState:
     allow_negative: bool
     balance: int
     version: int
+    held: int = 0
+    """Total of the account's active holds; the available balance is ``balance - held``."""
+
+    @property
+    def available(self) -> int:
+        return self.balance - self.held
+
+
+@dataclass(frozen=True, slots=True)
+class HoldState:
+    """What the hold rules need to know about a hold, detached from the ORM."""
+
+    id: UUID
+    status: HoldStatus
+    """The stored status: active, captured or voided."""
+    amount: int
+    expires_at: datetime
 
 
 def validate_entries(entries: Sequence[EntryDraft]) -> None:
@@ -125,7 +177,9 @@ def apply_entries(
     """Return the balance each touched account would have after posting ``entries``.
 
     Raises InsufficientFunds if an account that does not allow negative balances
-    would drop below zero.
+    would drop below zero, counting its active holds: such an account may spend
+    only its available balance, so posted entries can never take funds that a
+    hold has reserved.
     """
     new_balances: dict[UUID, int] = {}
     for entry in entries:
@@ -133,8 +187,8 @@ def apply_entries(
         current = new_balances.get(account.id, account.balance)
         change = balance_change(account.normal_balance, entry.amount)
         updated = current + change
-        if updated < 0 and not account.allow_negative:
-            raise InsufficientFunds(account.id, balance=current, change=change)
+        if updated - account.held < 0 and not account.allow_negative:
+            raise InsufficientFunds(account.id, balance=current, change=change, held=account.held)
         if abs(updated) > MAX_MAGNITUDE:
             raise InvalidTransaction(
                 f"account {account.id} balance would leave the supported range of "
@@ -178,3 +232,66 @@ def reversal_entries(entries: Sequence[EntryDraft]) -> list[EntryDraft]:
         EntryDraft(account_id=entry.account_id, amount=-entry.amount, currency=entry.currency)
         for entry in entries
     ]
+
+
+def hold_status(stored: HoldStatus, expires_at: datetime, now: datetime) -> HoldStatus:
+    """The status a client sees: an active hold counts as expired from ``expires_at`` on."""
+    if stored is HoldStatus.ACTIVE and now >= expires_at:
+        return HoldStatus.EXPIRED
+    return stored
+
+
+def check_hold_request(
+    source: AccountState,
+    destination: AccountState,
+    amount: int,
+    currency: str,
+    *,
+    expires_at: datetime,
+    now: datetime,
+) -> None:
+    """Check that a new hold may reserve ``amount`` on ``source`` for ``destination``.
+
+    A hold is a transfer that has not happened yet, so it follows the transfer
+    rules (two different accounts with the same normal balance side, in the
+    accounts' currency) and the same funds rule: posting the transfer right now
+    must be allowed, counting the source's other active holds.
+    """
+    if expires_at <= now:
+        raise InvalidHold(
+            f"expires_at ({timestamp(expires_at)}) must be later than the server's "
+            f"current time ({timestamp(now)})",
+            expires_at=timestamp(expires_at),
+            server_time=timestamp(now),
+        )
+    drafts = transfer_entries(source, destination, amount, currency)
+    accounts = {source.id: source, destination.id: destination}
+    check_currencies(drafts, accounts)
+    apply_entries(drafts, accounts)
+
+
+def require_active(hold: HoldState, now: datetime) -> None:
+    """Only an active hold can be captured or voided, and only before it expires."""
+    status = hold_status(hold.status, hold.expires_at, now)
+    if status is HoldStatus.EXPIRED:
+        raise HoldExpired(hold.id, hold.expires_at)
+    if status is not HoldStatus.ACTIVE:
+        raise HoldNotActive(hold.id, status)
+
+
+def capture_amount(hold: HoldState, requested: int | None) -> int:
+    """The amount a capture posts: the requested amount, or the whole hold by default.
+
+    A capture may take less than was authorized (the rest is released) but never more.
+    """
+    amount = hold.amount if requested is None else requested
+    if amount <= 0:
+        raise InvalidHold("the capture amount must be positive", hold_id=str(hold.id))
+    if amount > hold.amount:
+        raise InvalidHold(
+            f"cannot capture {amount}: hold {hold.id} authorized only {hold.amount}",
+            hold_id=str(hold.id),
+            authorized_amount=hold.amount,
+            requested_amount=amount,
+        )
+    return amount

@@ -5,11 +5,12 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select, update
 
 from ledgerline.api.app import create_app
 from ledgerline.config import Settings
 from ledgerline.idempotency import request_fingerprint
+from ledgerline.models import IdempotencyRecord
 from ledgerline.schemas import ReversalCreate
 from tests.support import Json, balance, deposit, open_account, post, problem_type
 
@@ -186,3 +187,41 @@ def test_fingerprint_covers_method_path_and_body() -> None:
     assert request_fingerprint("POST", "/r", None) != request_fingerprint(
         "POST", "/r", ReversalCreate()
     )
+
+
+def strip_fields_from_stored_response(engine: Engine, key: str, *fields: str) -> None:
+    """Make a stored response look like one written before these fields existed."""
+    with engine.begin() as connection:
+        [(principal, body)] = connection.execute(
+            select(IdempotencyRecord.principal, IdempotencyRecord.response_body).where(
+                IdempotencyRecord.key == key
+            )
+        ).all()
+        old_body = {name: value for name, value in body.items() if name not in fields}
+        connection.execute(
+            update(IdempotencyRecord)
+            .where(IdempotencyRecord.principal == principal, IdempotencyRecord.key == key)
+            .values(response_body=old_body)
+        )
+
+
+def test_responses_stored_before_holds_existed_still_replay(
+    client: TestClient, db: Engine, wallets: tuple[Json, Json]
+) -> None:
+    # Version 0.1.0 stored account and transaction responses without the hold
+    # fields. Replaying such a record must still work after the upgrade.
+    body = {"name": "Savings", "type": "liability", "currency": "USD"}
+    created = post(client, "/v1/accounts", body, key="open-savings-0.1.0")
+    strip_fields_from_stored_response(db, "open-savings-0.1.0", "held_amount", "available_balance")
+    replay = post(client, "/v1/accounts", body, key="open-savings-0.1.0")
+    assert replay.headers["Idempotent-Replayed"] == "true"
+    assert replay.json() == created.json()
+    assert (replay.json()["held_amount"], replay.json()["available_balance"]) == (0, 0)
+
+    alice, bob = wallets
+    transfer = post(client, "/v1/transfers", transfer_body(alice, bob, 100), key="pay-0.1.0")
+    strip_fields_from_stored_response(db, "pay-0.1.0", "captures_hold_id")
+    replay = post(client, "/v1/transfers", transfer_body(alice, bob, 100), key="pay-0.1.0")
+    assert replay.status_code == 201
+    assert replay.json() == transfer.json()
+    assert replay.json()["captures_hold_id"] is None
