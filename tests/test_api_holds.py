@@ -293,6 +293,18 @@ class TestCapture:
         assert account_balances(clocked_client, bob) == (3_200, 0, 3_200)
         assert get_hold(clocked_client, other)["status"] == "active"
 
+    def test_a_hold_on_the_whole_balance_can_be_captured_in_full(
+        self, clocked_client: TestClient, clock: FakeClock, alice: Json, bob: Json
+    ) -> None:
+        # The funds check on the capture must not count the hold being captured:
+        # its funds are the posting itself.
+        hold = authorize(clocked_client, alice, bob, 10_000, expires_at=clock.now + HOUR)
+        assert account_balances(clocked_client, alice) == (10_000, 10_000, 0)
+        response = capture(clocked_client, hold)
+        assert response.status_code == 200, response.text
+        assert account_balances(clocked_client, alice) == (0, 0, 0)
+        assert account_balances(clocked_client, bob) == (10_000, 0, 10_000)
+
     def test_capture_takes_a_description_and_metadata_for_the_posting(
         self, clocked_client: TestClient, clock: FakeClock, alice: Json, bob: Json
     ) -> None:

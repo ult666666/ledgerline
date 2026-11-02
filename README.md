@@ -1,8 +1,8 @@
 # ledgerline
 
 A double-entry ledger service: balanced, immutable journal entries, idempotent
-writes and race-free balance checks, built with FastAPI, SQLAlchemy 2 and
-PostgreSQL or SQLite.
+writes, race-free balance checks and holds (two-phase transfers), built with
+FastAPI, SQLAlchemy 2 and PostgreSQL or SQLite.
 
 [![CI](https://github.com/ult666666/ledgerline/actions/workflows/ci.yml/badge.svg)](https://github.com/ult666666/ledgerline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -41,8 +41,15 @@ tests each one. The reasoning behind every choice is in
   A retry with the same body replays the original response
   (`Idempotent-Replayed: true`); the same key with a different body is a `409`;
   concurrent duplicates take effect exactly once.
+- **Holds (two-phase transfers).** Authorize an amount from one account
+  toward another, then capture all or part of it (one balanced journal
+  transaction; the rest is released), void it, or let it expire. Accounts
+  report a ledger balance (posted entries), the amount held by active holds
+  and the available balance (ledger minus held). Holds and postings both draw
+  on the available balance, so held funds cannot be spent twice, even under
+  concurrent requests.
 - **Point-in-time balances and statements** with running balances and cursor
-  pagination.
+  pagination; `as_of` also reports what was held and available at that time.
 - **RFC 9457 errors** (`application/problem+json`) with a documented
   [error catalogue](docs/errors.md).
 - **Operations basics:** structured JSON logs with request IDs and timings,
@@ -105,6 +112,8 @@ with `uv run ledgerline generate-key` (see [Security notes](#security-notes)).
 | `POST /v1/transactions`, `GET /v1/transactions/{id}` | Post or read a journal transaction |
 | `POST /v1/transfers` | Move money between two accounts with the same normal balance side |
 | `POST /v1/transactions/{id}/reverse` | Reverse a transaction |
+| `POST /v1/holds`, `GET /v1/holds/{id}` | Authorize (reserve funds for a later transfer) or read a hold |
+| `POST /v1/holds/{id}/capture`, `POST /v1/holds/{id}/void` | Post all or part of a hold, or release it |
 | `GET /healthz`, `GET /readyz` | Liveness and readiness (no authentication) |
 
 **Sign convention.** Entry amounts are signed: positive is a debit, negative a
@@ -136,9 +145,27 @@ api $BASE/transfers -H "Idempotency-Key: dinner-alice-bob" -d @- <<EOF | jq
 EOF
 ```
 
+A hold reserves money now and moves it later, as a card authorization does.
+Alice reserves $40.00 for a ride, then the ride costs $32.00:
+
+```bash
+EXPIRES=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)   # GNU date
+RIDE=$(api $BASE/holds -H "Idempotency-Key: ride-hold-001" -d @- <<EOF | jq -r .id
+{"from_account_id": "$ALICE", "to_account_id": "$BOB", "amount": 4000,
+ "currency": "USD", "expires_at": "$EXPIRES"}
+EOF
+)
+api $BASE/accounts/$ALICE | jq '{balance, held_amount, available_balance}'
+api $BASE/holds/$RIDE/capture -H "Idempotency-Key: ride-capture-001" -d '{"amount": 3200}' | jq .status
+```
+
+The hold leaves the ledger balance alone and lowers the available balance by
+4000; the capture posts 3200 and releases the other 800.
+
 [docs/API_WALKTHROUGH.md](docs/API_WALKTHROUGH.md) runs the full session with every
 response: the replayed retry, a rejected key reuse, a refused overdraft,
-statements, a reversal with point-in-time balances and reconciliation.
+statements, a reversal with point-in-time balances, holds (partial capture,
+void, expiry, held funds that cannot be spent) and reconciliation.
 
 ## Architecture
 
@@ -157,7 +184,7 @@ flowchart LR
 | --- | --- |
 | `api/` | Routes, bearer-key auth, Idempotency-Key handling, RFC 9457 error mapping, request middleware |
 | `service.py` | Transaction boundaries: idempotency lookup, posting, compare-and-swap, retries |
-| `domain.py` | Pure double-entry rules (balancing, normal balances, overdrafts, transfers, reversals) |
+| `domain.py` | Pure double-entry rules (balancing, normal balances, overdrafts, transfers, reversals) and the hold state machine |
 | `repository.py` | Every SQL statement, including the version-checked balance update |
 | `models.py`, `migrations/` | Typed SQLAlchemy models (`Mapped[...]`) and the Alembic migration, with CHECK, UNIQUE and FK constraints |
 | `reconcile.py`, `cli.py` | Recompute the invariants from the journal; `ledgerline serve`, `ledgerline reconcile` and `ledgerline generate-key` |
@@ -183,6 +210,9 @@ was chosen over `SELECT ... FOR UPDATE`, and what that costs.
 | Posted transactions never change; each has at most one reversal, which cannot itself be reversed | No update or delete paths; `UNIQUE (reverses_id)` | API tests, state machine |
 | One idempotency key, one effect | Response stored under `PRIMARY KEY (principal, key)` in the same DB transaction as the effect | Threaded duplicate test, forced key-race test, state machine replays |
 | Statement running balances match the entries | `balance_after` written with each entry | State machine |
+| Active holds never exceed the balance of an account with `allow_negative: false`; postings cannot spend held funds | Every posting and hold checks the available balance; every write that changes it compare-and-swaps the account's version | Hold state machine, threaded hold tests, `reconcile` |
+| A hold moves only from active to captured, voided or expired, once; captured never exceeds authorized | Guarded `UPDATE ... WHERE status = 'active' AND expires_at > now`; `CHECK`s on the fields each status sets | Hold state machine, race tests, constraint tests, `reconcile` |
+| Each captured hold is in the journal exactly once, for the captured amount | `UNIQUE (hold_id)` on transactions; the hold is closed before the posting is inserted | Race tests, `reconcile` |
 
 The test suite (`tests/`) includes:
 
@@ -199,8 +229,19 @@ The test suite (`tests/`) includes:
   updates, and send 10 identical requests sharing one key and check that
   exactly one takes effect. Further tests force the stale-read and key-race
   paths deterministically.
-- **Migration tests** that run `alembic upgrade head` on an empty database,
-  compare the result with the models and run the API on it.
+- **A hold state machine test** (`tests/test_holds_stateful.py`): Hypothesis
+  drives authorizations, full and partial captures, voids, refunds,
+  transfers, replays and a fake clock that expires holds, against an
+  in-memory model of every balance and hold, and runs `reconcile` after every
+  step.
+- **Hold concurrency tests** (`tests/test_holds_concurrency.py`): 40
+  concurrent 30-cent holds against 1,000 cents give exactly 33 holds; holds
+  and transfers racing on one account share a single available balance; ten
+  racing captures and voids of one hold produce one winner and nine
+  `409 hold-not-active`.
+- **Migration tests** that run `alembic upgrade head` on an empty database and
+  on a 0001 database that already holds data, compare the result with the
+  models, run the API on it and downgrade again.
 
 ## Development
 
@@ -240,7 +281,10 @@ the whole stack on every push: it starts both containers, drives the API with
 container. The script opens accounts, posts a deposit and a transfer, checks a
 replayed retry, a rejected key reuse and a refused overdraft, and sends 20
 concurrent transfers that together ask for more than the wallet holds: exactly
-the 15 that fit succeed, and the balances still add up.
+the 15 that fit succeed, and the balances still add up. It then sends 25
+concurrent holds that ask for more than a second wallet holds (exactly 20
+succeed), captures part of one, voids another and checks the ledger, held and
+available balances.
 
 ```bash
 docker compose up --build     # API on http://127.0.0.1:8000, PostgreSQL 17 alongside
@@ -263,7 +307,7 @@ override it.
   standard pattern for random tokens: nobody can recover a 256-bit token from
   its hash, and a slow password hash would only add work to every request. It
   does not protect a weak, hand-typed key, which someone with the logs could
-  guess offline. [docs/DESIGN.md](docs/DESIGN.md#11-errors-logging-and-authentication)
+  guess offline. [docs/DESIGN.md](docs/DESIGN.md#12-errors-logging-and-authentication)
   has the details.
 
 ## Limitations and roadmap
@@ -283,9 +327,15 @@ This is a portfolio project, not production software. In particular:
   (see DESIGN.md).
 - **SQLite is for development.** It serialises writers (`BEGIN IMMEDIATE`);
   use PostgreSQL for anything concurrent.
-- **No pending or held funds and no backdated entries.** `posted_at` is
-  assigned by the server, and point-in-time history assumes a single server
-  clock.
+- **Holds are deliberately simple.** One capture per hold (no incremental or
+  multiple partial captures), no raising an existing hold, no hold listing,
+  no maximum duration for `expires_at`, and the destination does not see
+  pending credits. Expiry is lazy (computed when read; see DESIGN.md), so
+  nothing fires when a hold lapses, and a replayed authorization returns the
+  original `active` response even after the hold expired.
+- **No backdated entries.** `posted_at` is assigned by the server, and
+  point-in-time history (including held and available balances) assumes a
+  single server clock.
 - **Idempotency records are kept forever** and only successful responses are
   stored, so a request that failed can be retried with the same key.
 - **No account updates or closures and no transaction search;** no
@@ -295,14 +345,16 @@ This is a portfolio project, not production software. In particular:
   3.13) and on PostgreSQL 17, validates `docker-compose.yml`, builds the image
   and smoke-tests the running container (health check, `/healthz`, `/readyz`
   and an authenticated API call). It also runs the compose stack (API and
-  PostgreSQL 17) end to end, including 20 concurrent transfers against one
-  wallet, and reconciles the result.
+  PostgreSQL 17) end to end, including 20 concurrent transfers and 25
+  concurrent holds against single wallets, and reconciles the result.
 
 ## References
 
 - [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
 - [The Idempotency-Key HTTP Header Field (IETF draft)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
 - [Stripe API: idempotent requests](https://docs.stripe.com/api/idempotent_requests)
+- [TigerBeetle: two-phase transfers](https://docs.tigerbeetle.com/coding/two-phase-transfers/)
+- [Stripe: place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method)
 - [PostgreSQL: transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html),
   including how `UPDATE ... WHERE` behaves under concurrent updates at Read Committed
 - [SQLite: BEGIN IMMEDIATE](https://www.sqlite.org/lang_transaction.html)

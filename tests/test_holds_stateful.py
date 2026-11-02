@@ -134,9 +134,14 @@ class HoldMachine(RuleBasedStateMachine):
         source, destination = data.draw(st.sampled_from(self._pairs()))
         self._transfer(source, destination, amount)
 
-    @rule(data=st.data(), amount=amounts, ttl=st.integers(min_value=1, max_value=300))
-    def authorize(self, data: st.DataObject, amount: int, ttl: int) -> None:
+    @rule(data=st.data(), ttl=st.integers(min_value=1, max_value=300))
+    def authorize(self, data: st.DataObject, ttl: int) -> None:
         source, destination = data.draw(st.sampled_from(self._pairs()))
+        # Often reserve about all that is available: the edge where holds,
+        # captures and transfers compete for the last units.
+        available = max(1, source.balance - self._held(source))
+        near_all = st.integers(min_value=max(1, available - 3), max_value=available + 3)
+        amount = data.draw(amounts | near_all)
         expires_at = self.clock.now + timedelta(seconds=ttl)
         body = {
             "from_account_id": source.id,

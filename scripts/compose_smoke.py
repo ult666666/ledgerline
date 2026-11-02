@@ -5,9 +5,11 @@ Usage: ``python scripts/compose_smoke.py [--base-url URL]`` with the API key in
 the project environment against any deployment.
 
 It opens three accounts, then checks a deposit, a transfer, a replayed retry, a
-rejected key reuse and a refused overdraft. Last, it sends concurrent transfers
+rejected key reuse and a refused overdraft. Then it sends concurrent transfers
 that together ask for more than one wallet holds, and checks that exactly the
-affordable ones succeed and the balances still add up.
+affordable ones succeed and the balances still add up. Last, it does the same
+with concurrent holds on another wallet, then captures part of one hold, voids
+another and checks the ledger, held and available balances.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -95,14 +98,14 @@ def balance(client: Client, account_id: str) -> int:
     return value
 
 
-def transfer_with_retries(client: Client, body: Json, key: str) -> Reply:
+def post_with_retries(client: Client, path: str, body: Json, key: str) -> Reply:
     """Retry a concurrency conflict with the same key, as the API asks clients to."""
     for _ in range(30):
-        reply = client.call("POST", "/v1/transfers", body, key=key)
+        reply = client.call("POST", path, body, key=key)
         if reply.status != 409 or not str(reply.body.get("type", "")).endswith("concurrent-update"):
             return reply
         time.sleep(0.05)
-    raise SmokeError(f"transfer {key} still conflicted after 30 attempts")
+    raise SmokeError(f"POST {path} with key {key} still conflicted after 30 attempts")
 
 
 def run(client: Client, run_id: str) -> Json:
@@ -142,7 +145,10 @@ def run(client: Client, run_id: str) -> Json:
     with ThreadPoolExecutor(max_workers=20) as pool:
         replies = list(
             pool.map(
-                lambda i: transfer_with_retries(client, payment, f"{run_id}-burst-{i}"), range(20)
+                lambda i: post_with_retries(
+                    client, "/v1/transfers", payment, f"{run_id}-burst-{i}"
+                ),
+                range(20),
             )
         )
     statuses = sorted(reply.status for reply in replies)
@@ -156,7 +162,62 @@ def run(client: Client, run_id: str) -> Json:
     }
     if balances != {"cash": 10000, "alice": 0, "bob": 10000}:
         raise SmokeError(f"unexpected balances after the run: {balances}")
-    return {"concurrent_transfers": {"posted": 15, "refused": 5}, "balances_cents": balances}
+    return {
+        "concurrent_transfers": {"posted": 15, "refused": 5},
+        "balances_cents": balances,
+        "holds": run_holds(client, run_id, cash=cash, merchant=bob),
+    }
+
+
+def run_holds(client: Client, run_id: str, *, cash: str, merchant: str) -> Json:
+    """Concurrent holds on one wallet, then a partial capture and a void."""
+    carol = open_account(client, "Carol wallet", "liability")
+    top_up = {
+        "entries": [
+            {"account_id": cash, "amount": 10000, "currency": "USD"},
+            {"account_id": carol, "amount": -10000, "currency": "USD"},
+        ]
+    }
+    client.call("POST", "/v1/transactions", top_up, key=f"{run_id}-carol").expect(201, "top-up")
+
+    # Carol holds 10,000 cents. Twenty-five concurrent 500-cent holds ask for
+    # 12,500: exactly twenty fit, and none of them posts anything.
+    expires_at = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    hold = {
+        "from_account_id": carol,
+        "to_account_id": merchant,
+        "amount": 500,
+        "currency": "USD",
+        "expires_at": expires_at,
+    }
+    with ThreadPoolExecutor(max_workers=25) as pool:
+        replies = list(
+            pool.map(
+                lambda i: post_with_retries(client, "/v1/holds", hold, f"{run_id}-hold-{i}"),
+                range(25),
+            )
+        )
+    statuses = sorted(reply.status for reply in replies)
+    if statuses != [201] * 20 + [422] * 5:
+        raise SmokeError(f"concurrent holds: expected 20 x 201 and 5 x 422, got {statuses}")
+    held = [reply.body["id"] for reply in replies if reply.status == 201]
+
+    captured = client.call(
+        "POST", f"/v1/holds/{held[0]}/capture", {"amount": 300}, key=f"{run_id}-capture"
+    ).expect(200, "partial capture")
+    if (captured["status"], captured["captured_amount"]) != ("captured", 300):
+        raise SmokeError(f"partial capture: {captured}")
+    client.call("POST", f"/v1/holds/{held[1]}/void", key=f"{run_id}-void").expect(200, "void")
+    client.call("POST", f"/v1/holds/{held[1]}/capture", key=f"{run_id}-late").expect(
+        409, "capture after void"
+    )
+
+    account = client.call("GET", f"/v1/accounts/{carol}").expect(200, "read Carol")
+    reported = {key: account[key] for key in ("balance", "held_amount", "available_balance")}
+    # 300 captured from one hold (the other 200 released), one hold voided: 18 remain.
+    if reported != {"balance": 9700, "held_amount": 9000, "available_balance": 700}:
+        raise SmokeError(f"unexpected balances for Carol: {reported}")
+    return {"authorized": 20, "refused": 5, "carol_cents": reported}
 
 
 def main(argv: list[str] | None = None) -> int:

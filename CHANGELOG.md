@@ -8,6 +8,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Holds (two-phase transfers): `POST /v1/holds` authorizes an amount from one
+  account toward another, `POST /v1/holds/{id}/capture` posts all or part of
+  it as one journal transaction and releases the rest,
+  `POST /v1/holds/{id}/void` releases it, and `GET /v1/holds/{id}` reads it.
+  Holds expire lazily at their required `expires_at`. Every hold write uses
+  `Idempotency-Key`.
+- `held_amount` and `available_balance` (ledger balance minus active holds)
+  on account and balance responses, including `as_of` balances.
+  `captures_hold_id` on transactions.
+- Problem types `invalid-hold`, `hold-not-active` and `hold-expired`.
+- `ledgerline reconcile` checks that hold states follow the state machine,
+  that active holds fit the balance of accounts that cannot go negative, and
+  that each capture is in the journal exactly once, for the captured amount.
+- Alembic revision 0002 (`holds` table, `transactions.hold_id`).
+- Tests: a Hypothesis state machine of holds against an in-memory model,
+  hold API, concurrency, constraint and migration tests. The compose smoke
+  test also races 25 holds against one wallet.
+- `LedgerService` and `create_app` accept a `clock`, which supplies every
+  timestamp and expiry decision.
+
 - `examples/wallet_demo.py`: a wallet lifecycle (deposit, transfer, retried
   request, refused overdraft, reversal, historical balances, reconciliation)
   against a temporary local server and database. The walkthrough is in
@@ -24,9 +44,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Postings (transfers, journal transactions, reversals) check the available
+  balance, so they cannot spend funds reserved by holds. The
+  `insufficient-funds` problem reports `held_amount` and `available_balance`.
+- `ledgerline reconcile` prints the number of holds and three more checks.
+- On SQLite, migrations turn foreign-key enforcement off while they run and
+  check every reference before committing, so table rebuilds work on a
+  database that already holds data.
 - The build backend requirement is now `uv_build>=0.13.5,<0.14.0`.
 - The full API walkthrough moved from the README to `docs/API_WALKTHROUGH.md`;
   the README keeps the endpoint table and a short example.
+
+### Fixed
+
+- On PostgreSQL, a reversal racing another reversal of the same transaction
+  could fail with a 500 (`UNIQUE (reverses_id)`) instead of
+  `409 already-reversed`. The existing-reversal check now runs after the
+  balance read.
+- A problem extension can no longer overwrite a standard RFC 9457 member such
+  as `status`.
 
 ## 0.1.0 - 2026-10-23
 
