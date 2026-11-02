@@ -4,11 +4,12 @@ Request models validate shape and per-field limits (types, formats, sizes);
 the accounting rules that span several fields live in ledgerline.domain.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -43,6 +44,21 @@ PositiveAmount = Annotated[
     int,
     Field(strict=True, gt=0, le=MAX_MAGNITUDE, description="Integer minor units.", examples=[2500]),
 ]
+
+
+def _representable_in_utc(value: datetime) -> datetime:
+    # Timestamps are stored and compared in UTC. A valid offset can move an
+    # instant near the ends of the calendar out of the years 1 to 9999 there,
+    # where Python cannot represent it: reject it here instead of failing later.
+    try:
+        value.astimezone(UTC)
+    except OverflowError:
+        raise ValueError("the timestamp is outside the years 1 to 9999 in UTC") from None
+    # Return the value as given, so idempotency fingerprints and echoed values keep it.
+    return value
+
+
+AwareTimestamp = Annotated[AwareDatetime, AfterValidator(_representable_in_utc)]
 Description = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]
 Metadata = Annotated[
     dict[
@@ -103,7 +119,7 @@ class HoldCreate(RequestModel):
     to_account_id: UUID
     amount: PositiveAmount
     currency: Currency
-    expires_at: AwareDatetime = Field(
+    expires_at: AwareTimestamp = Field(
         description="When the hold lapses if it is not captured or voided first. ISO 8601 "
         "with a timezone, later than the current time.",
         examples=["2026-11-08T12:00:00Z"],

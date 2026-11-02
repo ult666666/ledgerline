@@ -149,6 +149,16 @@ def test_balance_as_of_requires_a_timezone(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("as_of", ["9999-12-31T23:00:00-05:00", "0001-01-01T00:30:00+01:00"])
+def test_balance_as_of_must_be_representable_in_utc(client: TestClient, as_of: str) -> None:
+    # Valid ISO 8601 with an offset, but outside the years 1 to 9999 once in UTC:
+    # a validation error, not a 500 from the database layer.
+    account = open_account(client)
+    response = client.get(f"/v1/accounts/{account['id']}/balance", params={"as_of": as_of})
+    assert response.status_code == 422
+    assert problem_type(response) == "validation-error"
+
+
 def test_balance_of_unknown_account_is_404(client: TestClient) -> None:
     assert client.get(f"/v1/accounts/{uuid4()}/balance").status_code == 404
 

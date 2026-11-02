@@ -63,6 +63,14 @@ All notable changes to this project are documented here. The format follows
   balance read.
 - A problem extension can no longer overwrite a standard RFC 9457 member such
   as `status`.
+- Holds on an account that may go negative were not range-checked:
+  `held_amount` and `available_balance` could leave +/-(2^53 - 1), and on
+  SQLite about 1,025 maximal holds overflowed `SUM`, so every read or write of
+  that account failed with a 500. Holds and postings that would take either
+  balance out of range are now refused with a 422.
+- A hold `expires_at` or a balance `as_of` with an offset that moves it outside
+  the years 1 to 9999 in UTC (for example `9999-12-31T23:00:00-05:00`) caused a
+  500; it is now a `422 validation-error`.
 
 ## 0.1.0 - 2026-10-23
 

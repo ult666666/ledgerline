@@ -194,6 +194,13 @@ def apply_entries(
                 f"account {account.id} balance would leave the supported range of "
                 f"+/-{MAX_MAGNITUDE} minor units"
             )
+        # Only an account that may go negative can get here with holds pushing
+        # its available balance (balance - held) below the range.
+        if updated - account.held < -MAX_MAGNITUDE:
+            raise InvalidTransaction(
+                f"account {account.id} available balance would leave the supported range of "
+                f"+/-{MAX_MAGNITUDE} minor units"
+            )
         new_balances[account.id] = updated
     return new_balances
 
@@ -255,7 +262,9 @@ def check_hold_request(
     A hold is a transfer that has not happened yet, so it follows the transfer
     rules (two different accounts with the same normal balance side, in the
     accounts' currency) and the same funds rule: posting the transfer right now
-    must be allowed, counting the source's other active holds.
+    must be allowed, counting the source's other active holds. The source's
+    held and available balances must also stay within +/-MAX_MAGNITUDE; funds
+    do not bound the holds of an account that may go negative, so this does.
     """
     if expires_at <= now:
         raise InvalidHold(
@@ -268,6 +277,14 @@ def check_hold_request(
     accounts = {source.id: source, destination.id: destination}
     check_currencies(drafts, accounts)
     apply_entries(drafts, accounts)
+    if source.held + amount > MAX_MAGNITUDE:
+        raise InvalidHold(
+            f"account {source.id} already holds {source.held} in active holds; another "
+            f"{amount} would leave the supported range of +/-{MAX_MAGNITUDE} minor units",
+            account_id=str(source.id),
+            held_amount=source.held,
+            requested_amount=amount,
+        )
 
 
 def require_active(hold: HoldState, now: datetime) -> None:

@@ -68,13 +68,16 @@ inside a request body are reported the same way.
 `422`. The body, path or query parameters do not match the schema: wrong
 types (amounts must be JSON integers, not `12.5` or `"1250"`), unknown fields,
 a currency that is not three upper-case letters, a timestamp without a
-timezone, and so on. Extension: `errors`, a list of `{loc, msg, type}`.
+timezone or outside the years 1 to 9999 once converted to UTC, and so on.
+Extension: `errors`, a list of `{loc, msg, type}`.
 
 ## invalid-transaction
 
 `422`. The entries break a posting rule: fewer than two entries, a zero
 amount, the same account twice, an amount or resulting balance outside
-+/-(2^53 - 1), or an entry whose currency differs from its account's.
++/-(2^53 - 1), or an entry whose currency differs from its account's. A
+posting or hold that would take an account's available balance below
+-(2^53 - 1) gets the same answer.
 
 ## unbalanced-transaction
 
@@ -104,9 +107,11 @@ transaction.
 ## invalid-hold
 
 `422`. The hold request breaks a hold rule: `expires_at` is not later than the
-server's current time (extensions `expires_at` and `server_time`), or a
-capture asks for more than the hold authorized (extensions `hold_id`,
-`authorized_amount` and `requested_amount`). Nothing was written.
+server's current time (extensions `expires_at` and `server_time`), the
+source's active holds would total more than 2^53 - 1 (extensions
+`account_id`, `held_amount` and `requested_amount`), or a capture asks for
+more than the hold authorized (extensions `hold_id`, `authorized_amount` and
+`requested_amount`). Nothing was written.
 
 ## already-reversed
 

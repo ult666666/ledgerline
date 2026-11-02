@@ -4,7 +4,6 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request, Response, status
-from pydantic import AwareDatetime
 
 from ledgerline.api.dependencies import (
     IdempotencyKeyHeader,
@@ -13,7 +12,14 @@ from ledgerline.api.dependencies import (
     optional_idempotency,
     respond,
 )
-from ledgerline.schemas import AccountCreate, AccountOut, BalanceOut, Page, StatementLine
+from ledgerline.schemas import (
+    AccountCreate,
+    AccountOut,
+    AwareTimestamp,
+    BalanceOut,
+    Page,
+    StatementLine,
+)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -52,7 +58,7 @@ def get_balance(
     account_id: UUID,
     service: ServiceDep,
     as_of: Annotated[
-        AwareDatetime | None,
+        AwareTimestamp | None,
         Query(description="ISO 8601 timestamp with a timezone, e.g. 2026-01-31T23:59:59Z."),
     ] = None,
 ) -> BalanceOut:
