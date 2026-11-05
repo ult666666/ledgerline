@@ -53,7 +53,7 @@ All notable changes to this project are documented here. The format follows
 - On SQLite, migrations turn foreign-key enforcement off while they run and
   check every reference before committing, so table rebuilds work on a
   database that already holds data.
-- The build backend requirement is now `uv_build>=0.13.5,<0.14.0`.
+- The build backend requirement is now `uv_build>=0.13.6,<0.14.0`.
 - The full API walkthrough moved from the README to `docs/API_WALKTHROUGH.md`;
   the README keeps the endpoint table and a short example.
 - The README is organised as run, API tour and design notes, with a short
