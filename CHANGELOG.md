@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-05
+
 ### Added
 
 - Holds (two-phase transfers): `POST /v1/holds` authorizes an amount from one
