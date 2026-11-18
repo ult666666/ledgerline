@@ -149,8 +149,14 @@ class LedgerRepository:
         self.session.add(hold)
         self.session.flush()
 
-    def get_hold(self, hold_id: UUID) -> Hold | None:
-        return self.session.get(Hold, hold_id)
+    def get_hold_with_source_version(self, hold_id: UUID) -> tuple[Hold, int] | None:
+        """A capture or void changes the hold and its source version together."""
+        row = self.session.execute(
+            select(Hold, Account.version)
+            .join(Account, Account.id == Hold.from_account_id)
+            .where(Hold.id == hold_id)
+        ).first()
+        return None if row is None else (row[0], row[1])
 
     def get_hold_with_capture(self, hold_id: UUID) -> tuple[Hold, UUID | None] | None:
         """The hold and its optional capture transaction from the same snapshot."""
@@ -161,22 +167,19 @@ class LedgerRepository:
         ).first()
         return None if row is None else (row[0], row[1])
 
-    def held_amounts(
+    def reservation_balances(
         self, account_ids: Collection[UUID], *, now: datetime, excluding: UUID | None = None
-    ) -> dict[UUID, int]:
-        """Total of the active, unexpired holds on each account, as the source.
+    ) -> dict[UUID, tuple[int, int]]:
+        """Each account's version and held amount, seen by one statement.
 
-        ``excluding`` leaves out the hold that a capture is about to consume.
-        Accounts without holds are missing from the result.
+        A capture excludes its own hold because the posting consumes those funds.
         """
-        query = (
-            select(Hold.from_account_id, func.sum(Hold.amount))
-            .where(Hold.from_account_id.in_(account_ids), _active_at(now))
-            .group_by(Hold.from_account_id)
+        rows = self.session.execute(
+            select(
+                Account.id, Account.version, _held_now(Account.id, now, excluding=excluding)
+            ).where(Account.id.in_(account_ids))
         )
-        if excluding is not None:
-            query = query.where(Hold.id != excluding)
-        return {account_id: int(total) for account_id, total in self.session.execute(query)}
+        return {account_id: (version, int(held)) for account_id, version, held in rows}
 
     def close_hold(
         self, hold: Hold, *, status: HoldStatus, at: datetime, captured_amount: int | None = None
@@ -217,10 +220,13 @@ def _active_at(now: datetime) -> ColumnElement[bool]:
     return and_(Hold.status == HoldStatus.ACTIVE, Hold.expires_at > now)
 
 
-def _held_now(account_id: InstrumentedAttribute[UUID], now: datetime) -> ScalarSelect[int]:
+def _held_now(
+    account_id: InstrumentedAttribute[UUID], now: datetime, *, excluding: UUID | None = None
+) -> ScalarSelect[int]:
     """Correlated subquery: the total of an account's active, unexpired holds."""
-    return (
-        select(func.coalesce(func.sum(Hold.amount), 0))
-        .where(Hold.from_account_id == account_id, _active_at(now))
-        .scalar_subquery()
+    query = select(func.coalesce(func.sum(Hold.amount), 0)).where(
+        Hold.from_account_id == account_id, _active_at(now)
     )
+    if excluding is not None:
+        query = query.where(Hold.id != excluding)
+    return query.scalar_subquery()

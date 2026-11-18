@@ -532,16 +532,17 @@ an account's available balance goes through that account's compare-and-swap:
   the others wait for the winner's commit, re-check the `WHERE` clause and
   match nothing. The loser rolls back, retries, sees the closed hold and
   answers `409 hold-not-active`.
+- **Read versions before validating.** The service reads the version with each
+  account's balance, then reads it again alongside its active reservations at
+  the posting time. If a deposit and a new hold committed in between, the
+  write retries before it can combine the old balance with the new reservation
+  and report a false overdraft. A capture or void also reads the source version
+  with the hold, so a rival that closed the hold cannot leave the next request
+  validating an active hold against a wallet the winner has already drained.
 - **Order of writes in a capture.** The capture swaps the account balances,
-  then closes the hold, then inserts the journal rows. Running the suite on
-  PostgreSQL showed why the order matters. At Read Committed each statement
-  sees what had committed when it started, so a capture can read the hold
-  before a rival capture commits and read the accounts after it. Its balance
-  compare-and-swap then passes. When the insert came first, the duplicate
-  posting hit `UNIQUE (hold_id)` and the client got a 500; closing the hold
-  first turns it into the retry above. A test reproduces the interleaving
-  deterministically. The same reasoning moved the "already reversed?" check
-  in reversals after the balance read, which fixed the same latent race there.
+  conditionally closes the hold, then inserts the journal transaction. A failed
+  transition rolls back the balances and retries before any insert can conflict
+  with the unique capture link.
 - **Lock order.** Accounts in id order, then the hold row, in every write that
   touches a hold. Voids rewrite the source account (version bump) before the
   hold row, so no two writers wait on each other in a cycle.

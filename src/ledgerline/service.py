@@ -374,15 +374,8 @@ class LedgerService:
         """Post the hold's transfer, for all of it or less, and release any remainder."""
 
         def operation(repo: LedgerRepository) -> HoldOut:
-            hold = _require_hold(repo, hold_id)
-            # The hold being captured no longer counts against the source: its
-            # funds become the posting itself, and the remainder is released.
-            accounts, now = self._load_accounts(
-                repo, [hold.from_account_id, hold.to_account_id], excluding_hold=hold.id
-            )
-            state = _hold_state(hold)
-            require_active(state, now)
-            amount = capture_amount(state, request.amount)
+            hold, accounts, now = self._load_active_hold(repo, hold_id, capturing=True)
+            amount = capture_amount(_hold_state(hold), request.amount)
             drafts = transfer_entries(
                 accounts[hold.from_account_id], accounts[hold.to_account_id], amount, hold.currency
             )
@@ -403,15 +396,31 @@ class LedgerService:
         """Release a hold's funds without posting anything."""
 
         def operation(repo: LedgerRepository) -> HoldOut:
-            hold = _require_hold(repo, hold_id)
-            accounts, now = self._load_accounts(repo, [hold.from_account_id])
-            require_active(_hold_state(hold), now)
+            hold, accounts, now = self._load_active_hold(repo, hold_id, capturing=False)
             _bump_version(repo, accounts[hold.from_account_id])
             if not repo.close_hold(hold, status=HoldStatus.VOIDED, at=now):
                 raise _StaleHold
             return _hold_out(hold, now=now, capture_id=None)
 
         return self._write(idempotency, HoldOut, operation)
+
+    def _load_active_hold(
+        self, repo: LedgerRepository, hold_id: UUID, *, capturing: bool
+    ) -> tuple[Hold, dict[UUID, AccountState], datetime]:
+        found = repo.get_hold_with_source_version(hold_id)
+        if found is None:
+            raise HoldNotFound(hold_id)
+        hold, source_version = found
+        # A capture spends its reservation and posts to both accounts. A void
+        # only releases the source funds.
+        ids = [hold.from_account_id, hold.to_account_id] if capturing else [hold.from_account_id]
+        accounts, now = self._load_accounts(
+            repo, ids, excluding_hold=hold.id if capturing else None
+        )
+        if accounts[hold.from_account_id].version != source_version:
+            raise _StaleHold
+        require_active(_hold_state(hold), now)
+        return hold, accounts, now
 
     def _load_accounts(
         self,
@@ -433,19 +442,24 @@ class LedgerService:
             if account_id not in found:
                 raise AccountNotFound(account_id)
         now = self._clock()
-        held = repo.held_amounts(account_ids, now=now, excluding=excluding_hold)
-        states = {
-            account.id: AccountState(
+        reservations = repo.reservation_balances(account_ids, now=now, excluding=excluding_hold)
+        states = {}
+        for account in found.values():
+            version, held = reservations[account.id]
+            # A deposit followed by a hold can increase both balance and held.
+            # Mixing the old balance with the new hold can falsely refuse a
+            # spend before its compare-and-swap has a chance to notice.
+            if account.version != version:
+                raise _StaleBalance
+            states[account.id] = AccountState(
                 id=account.id,
                 currency=account.currency,
                 normal_balance=account.normal_balance,
                 allow_negative=account.allow_negative,
                 balance=account.balance,
-                version=account.version,
-                held=held.get(account.id, 0),
+                version=version,
+                held=held,
             )
-            for account in found.values()
-        }
         return states, now
 
     def _post(
@@ -476,12 +490,9 @@ class LedgerService:
                 raise _StaleBalance
         if capture is not None:
             hold, amount = capture
-            # Close the hold before inserting anything. On PostgreSQL a rival
-            # capture or void can commit between our read of the hold and our
-            # read of the accounts; our compare-and-swap then passes, so the
-            # guarded transition is what refuses this attempt (it retries and
-            # reports the hold as closed). Inserting first would trip the
-            # UNIQUE hold_id constraint instead.
+            # The guarded transition is the final check on the hold. Close it
+            # before inserting the journal so any losing attempt retries before
+            # it could collide with the unique capture link.
             if not repo.close_hold(
                 hold, status=HoldStatus.CAPTURED, at=posted_at, captured_amount=amount
             ):
@@ -564,13 +575,6 @@ def _require_account(repo: LedgerRepository, account_id: UUID) -> Account:
     if account is None:
         raise AccountNotFound(account_id)
     return account
-
-
-def _require_hold(repo: LedgerRepository, hold_id: UUID) -> Hold:
-    hold = repo.get_hold(hold_id)
-    if hold is None:
-        raise HoldNotFound(hold_id)
-    return hold
 
 
 def _bump_version(repo: LedgerRepository, account: AccountState) -> None:
