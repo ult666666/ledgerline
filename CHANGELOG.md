@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `uv run python examples/wallet_demo.py --holds` runs the hold lifecycle over
+  local HTTP and prints a repeatable JSON receipt with balances, replay checks
+  and reconciliation.
+
 ### Fixed
 
 - Concurrent requests using the same idempotency key now agree on the first

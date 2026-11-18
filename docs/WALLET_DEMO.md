@@ -40,6 +40,35 @@ temporary API key is left out. To keep a copy:
 uv run python examples/wallet_demo.py > /tmp/ledgerline-wallet-demo.json
 ```
 
+## Follow a hold from authorization to capture
+
+```bash
+uv run python examples/wallet_demo.py --holds
+```
+
+Alice funds her wallet with $100, authorizes a $40 ride, and pays a final fare
+of $32. The capture transfers $32 to Bob and frees the other $8. The demo sends
+the capture again with the same idempotency key, then reserves $15 for another
+ride and cancels it.
+
+The script reads Alice's balance over HTTP after each step. All amounts below
+are USD cents. `balance` is posted money and `available_balance` is what Alice
+can spend.
+
+| Step in the JSON receipt | balance | held_amount | available_balance |
+| --- | ---: | ---: | ---: |
+| `funded` | 10000 | 0 | 10000 |
+| `authorized` | 10000 | 4000 | 6000 |
+| `partially_captured` | 6800 | 0 | 6800 |
+| `capture_replayed` | 6800 | 0 | 6800 |
+| `second_authorized` | 6800 | 1500 | 5300 |
+| `voided` | 6800 | 0 | 6800 |
+
+The JSON `replay` fields check the response body, replay header, and capture
+transaction ID. Reconciliation finds two transactions (the deposit and the
+capture), four entries, and a zero USD trial balance. The receipt excludes
+generated identifiers and timestamps so repeated runs can be compared directly.
+
 ## Isolation and time limits
 
 The script creates a temporary directory for its SQLite database and binds a socket
