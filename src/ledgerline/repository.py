@@ -89,15 +89,31 @@ class LedgerRepository:
         )
         return result.rowcount == 1
 
-    def sum_entries(self, account_id: UUID, *, posted_at_or_before: datetime) -> int:
-        """Signed sum (debits positive) of an account's entries up to a point in time."""
-        total = self.session.scalar(
+    def get_account_history(
+        self, account_id: UUID, *, as_of: datetime
+    ) -> tuple[Account, int, int] | None:
+        """Read the signed journal total and historical reservations in one snapshot."""
+        posted = (
             select(func.coalesce(func.sum(Entry.amount), 0))
             .join(Transaction, Transaction.id == Entry.transaction_id)
-            .where(Entry.account_id == account_id, Transaction.posted_at <= posted_at_or_before)
+            .where(Entry.account_id == account_id, Transaction.posted_at <= as_of)
+            .scalar_subquery()
         )
-        # PostgreSQL returns SUM(bigint) as NUMERIC, i.e. a Decimal.
-        return int(total or 0)
+        # A hold counts from creation until the first of closing or expiry.
+        held = (
+            select(func.coalesce(func.sum(Hold.amount), 0))
+            .where(
+                Hold.from_account_id == account_id,
+                Hold.created_at <= as_of,
+                or_(Hold.closed_at.is_(None), Hold.closed_at > as_of),
+                Hold.expires_at > as_of,
+            )
+            .scalar_subquery()
+        )
+        row = self.session.execute(
+            select(Account, posted, held).where(Account.id == account_id)
+        ).first()
+        return None if row is None else (row[0], int(row[1]), int(row[2]))
 
     def list_entries(self, account_id: UUID, *, limit: int, after_id: int | None) -> list[Entry]:
         query = (
@@ -127,9 +143,6 @@ class LedgerRepository:
             select(Transaction.id).where(Transaction.reverses_id == transaction_id)
         )
 
-    def find_capture_id(self, hold_id: UUID) -> UUID | None:
-        return self.session.scalar(select(Transaction.id).where(Transaction.hold_id == hold_id))
-
     # Holds
 
     def add_hold(self, hold: Hold) -> None:
@@ -138,6 +151,15 @@ class LedgerRepository:
 
     def get_hold(self, hold_id: UUID) -> Hold | None:
         return self.session.get(Hold, hold_id)
+
+    def get_hold_with_capture(self, hold_id: UUID) -> tuple[Hold, UUID | None] | None:
+        """The hold and its optional capture transaction from the same snapshot."""
+        row = self.session.execute(
+            select(Hold, Transaction.id)
+            .outerjoin(Transaction, Transaction.hold_id == Hold.id)
+            .where(Hold.id == hold_id)
+        ).first()
+        return None if row is None else (row[0], row[1])
 
     def held_amounts(
         self, account_ids: Collection[UUID], *, now: datetime, excluding: UUID | None = None
@@ -155,23 +177,6 @@ class LedgerRepository:
         if excluding is not None:
             query = query.where(Hold.id != excluding)
         return {account_id: int(total) for account_id, total in self.session.execute(query)}
-
-    def sum_holds(self, account_id: UUID, *, active_at: datetime) -> int:
-        """Total of the holds on an account that were active at a point in time.
-
-        Uses the timestamps rather than the stored status, so it also answers
-        for the past: a hold counts from created_at until it was captured or
-        voided (closed_at) or it expired, whichever came first.
-        """
-        total = self.session.scalar(
-            select(func.coalesce(func.sum(Hold.amount), 0)).where(
-                Hold.from_account_id == account_id,
-                Hold.created_at <= active_at,
-                or_(Hold.closed_at.is_(None), Hold.closed_at > active_at),
-                Hold.expires_at > active_at,
-            )
-        )
-        return int(total or 0)
 
     def close_hold(
         self, hold: Hold, *, status: HoldStatus, at: datetime, captured_amount: int | None = None

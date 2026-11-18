@@ -8,12 +8,12 @@ tests force the conflict paths deterministically.
 """
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy.orm import Session
 
 from ledgerline.db import create_session_factory
@@ -241,6 +241,57 @@ def test_a_capture_that_read_the_hold_before_a_rival_committed_is_refused(
         balances
     )
     assert_reconciles(db)
+
+
+@pytest.mark.parametrize("read", ["hold", "historical-balance"])
+def test_one_read_cannot_mix_fields_from_before_and_after_a_capture(
+    service: LedgerService, db: Engine, read: str
+) -> None:
+    if db.dialect.name != "postgresql":
+        pytest.skip("SQLite holds its transaction lock across the entire read")
+    source, destination = funded_wallets(service, 1_000)
+    hold = authorize(service, source, destination, 400)
+    capture = HoldCapture(amount=250)
+    # Include the soon-to-be-posted capture, but keep the hold unexpired.
+    as_of = datetime.now(UTC) + timedelta(minutes=1)
+    table = "holds" if read == "hold" else "entries"
+    captured = False
+
+    def capture_after_select(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _context: object,
+        _many: bool,
+    ) -> None:
+        nonlocal captured
+        if captured or not statement.startswith("SELECT") or table not in statement:
+            return
+        # This SELECT has a snapshot. Commit the capture on a second connection
+        # before a following SELECT could see it under READ COMMITTED.
+        captured = True
+        service.capture_hold(hold.id, capture, keyed(f"/v1/holds/{hold.id}/capture", capture))
+
+    event.listen(db, "after_cursor_execute", capture_after_select)
+    try:
+        if read == "hold":
+            viewed = service.get_hold(hold.id)
+            assert viewed.status == HoldStatus.ACTIVE
+            assert viewed.capture_transaction_id is None
+        else:
+            balance = service.get_balance(source, as_of=as_of)
+            assert (balance.balance, balance.held_amount, balance.available_balance) == (
+                1_000,
+                400,
+                600,
+            )
+    finally:
+        event.remove(db, "after_cursor_execute", capture_after_select)
+    assert captured
+    assert service.get_hold(hold.id).capture_transaction_id is not None
+    balance = service.get_balance(source, as_of=as_of)
+    assert (balance.balance, balance.held_amount, balance.available_balance) == (750, 0, 750)
 
 
 def test_a_stale_balance_during_authorization_is_retried(

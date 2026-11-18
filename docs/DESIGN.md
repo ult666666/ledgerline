@@ -378,7 +378,10 @@ that are summed on read.
 
 `GET /v1/accounts/{id}/balance?as_of=T` sums the account's entries whose
 transaction has `posted_at <= T`; history is rebuilt from the immutable
-journal, not from the cached balance.
+journal, not from the cached balance. The same SELECT sums holds that were
+active at T. A capture changes both totals together. Reading the sums in
+separate SELECTs under PostgreSQL READ COMMITTED could pair the old posted
+balance with the newly released reservation.
 
 For that history to be consistent, `posted_at` must order transactions on the
 same account the way they were applied. `_post` takes the timestamp *after*
@@ -549,7 +552,8 @@ could be refused on stale data.
 
 All three hold writes need an `Idempotency-Key` and use the machinery from
 section 8. A replay returns the original response, even if the hold has since
-expired or been captured; `GET /v1/holds/{id}` shows the current state.
+expired or been captured; `GET /v1/holds/{id}` joins the hold and its capture
+transaction in one SELECT so the reported status and journal link agree.
 
 **Compatibility.** Earlier responses stored under idempotency keys lack the
 new response fields (`held_amount`, `available_balance`, `captures_hold_id`).

@@ -160,10 +160,11 @@ class LedgerService:
             else:
                 # History is rebuilt from the immutable entries and the hold
                 # timestamps, not from the cached balance.
-                account = _require_account(repo, account_id)
-                signed_total = repo.sum_entries(account_id, posted_at_or_before=as_of)
+                history = repo.get_account_history(account_id, as_of=as_of)
+                if history is None:
+                    raise AccountNotFound(account_id)
+                account, signed_total, held = history
                 balance = balance_change(account.normal_balance, signed_total)
-                held = repo.sum_holds(account_id, active_at=as_of)
             return BalanceOut(
                 account_id=account.id,
                 currency=account.currency,
@@ -211,9 +212,11 @@ class LedgerService:
 
     def get_hold(self, hold_id: UUID) -> HoldOut:
         with self._session_factory() as session:
-            repo = LedgerRepository(session)
-            hold = _require_hold(repo, hold_id)
-            return _hold_out(hold, now=self._clock(), capture_id=repo.find_capture_id(hold_id))
+            found = LedgerRepository(session).get_hold_with_capture(hold_id)
+            if found is None:
+                raise HoldNotFound(hold_id)
+            hold, capture_id = found
+            return _hold_out(hold, now=self._clock(), capture_id=capture_id)
 
     # Writes
 

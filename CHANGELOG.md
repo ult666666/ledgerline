@@ -12,6 +12,9 @@ All notable changes to this project are documented here. The format follows
   successful response even when that write spent the remaining funds or closed
   a hold. Reusing a committed key for a different, schema-valid journal request
   consistently returns `409 idempotency-key-reused`.
+- A hold read during capture now returns a matching status and journal link.
+  Historical balance reads report the posted and held amounts from one
+  database snapshot, including when a capture commits during the read.
 
 ## 0.2.0 - 2026-11-05
 

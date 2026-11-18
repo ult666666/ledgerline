@@ -160,7 +160,9 @@ def test_balance_as_of_must_be_representable_in_utc(client: TestClient, as_of: s
 
 
 def test_balance_of_unknown_account_is_404(client: TestClient) -> None:
-    assert client.get(f"/v1/accounts/{uuid4()}/balance").status_code == 404
+    url = f"/v1/accounts/{uuid4()}/balance"
+    assert client.get(url).status_code == 404
+    assert client.get(url, params={"as_of": "2026-01-01T00:00:00Z"}).status_code == 404
 
 
 def test_statement_lists_entries_with_running_balances(client: TestClient) -> None:
