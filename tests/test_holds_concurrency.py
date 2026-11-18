@@ -7,13 +7,14 @@ ends with a definite answer and the tests can assert exact counts. The last
 tests force the conflict paths deterministically.
 """
 
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy.orm import Session
 
 from ledgerline.db import create_session_factory
@@ -212,24 +213,24 @@ def test_a_capture_that_read_the_hold_before_a_rival_committed_is_refused(
         service.capture_hold(hold.id, first, keyed(f"/v1/holds/{hold.id}/capture", first))
     balances = (service.get_account(source).balance, service.get_account(destination).balance)
 
-    # On PostgreSQL (Read Committed) each statement sees what had committed when
-    # it started, so a capture can read the hold before the rival committed and
-    # the accounts after it. Its balance compare-and-swap then passes, and only
-    # the guarded state transition stands between it and a second posting.
-    real_get_hold = LedgerRepository.get_hold
+    # Give the service an active-looking hold with the latest source version
+    # to exercise the guarded UPDATE itself, even when the earlier version
+    # checks pass. It must roll back any balance changes and read the winner.
+    real_get_hold = LedgerRepository.get_hold_with_source_version
     reads = 0
 
-    def stale_first_read(repo: LedgerRepository, hold_id: UUID) -> Hold | None:
+    def stale_first_read(repo: LedgerRepository, hold_id: UUID) -> tuple[Hold, int] | None:
         nonlocal reads
         reads += 1
         found = real_get_hold(repo, hold_id)
         if reads > 1 or found is None:
             return found
-        columns = {column.key: getattr(found, column.key) for column in Hold.__mapper__.columns}
+        hold, source_version = found
+        columns = {column.key: getattr(hold, column.key) for column in Hold.__mapper__.columns}
         stale = {"status": HoldStatus.ACTIVE, "closed_at": None, "captured_amount": None}
-        return Hold(**{**columns, **stale})
+        return Hold(**{**columns, **stale}), source_version
 
-    monkeypatch.setattr(LedgerRepository, "get_hold", stale_first_read)
+    monkeypatch.setattr(LedgerRepository, "get_hold_with_source_version", stale_first_read)
     body = HoldCapture()
     with pytest.raises(HoldNotActive) as caught:
         service.capture_hold(hold.id, body, keyed(f"/v1/holds/{hold.id}/capture", body))
@@ -241,6 +242,106 @@ def test_a_capture_that_read_the_hold_before_a_rival_committed_is_refused(
         balances
     )
     assert_reconciles(db)
+
+
+@contextmanager
+def commit_after_read(db: Engine, table: str, write: Callable[[], object]) -> Iterator[None]:
+    """Commit on a second connection after the first SELECT that reads this table."""
+    if db.dialect.name != "postgresql":
+        pytest.skip("SQLite serializes writers before the first read")
+    committed = False
+
+    def interleave(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _context: object,
+        _many: bool,
+    ) -> None:
+        nonlocal committed
+        if not committed and statement.startswith("SELECT") and table in statement:
+            committed = True
+            write()
+
+    event.listen(db, "after_cursor_execute", interleave)
+    try:
+        yield
+    finally:
+        event.remove(db, "after_cursor_execute", interleave)
+    assert committed, "the read must overlap the committed write"
+
+
+@pytest.mark.parametrize("read", ["hold", "historical-balance"])
+def test_one_read_cannot_mix_fields_from_before_and_after_a_capture(
+    service: LedgerService, db: Engine, read: str
+) -> None:
+    source, destination = funded_wallets(service, 1_000)
+    hold = authorize(service, source, destination, 400)
+    capture = HoldCapture(amount=250)
+    # Include the soon-to-be-posted capture, but keep the hold unexpired.
+    as_of = datetime.now(UTC) + timedelta(minutes=1)
+    table = "holds" if read == "hold" else "entries"
+    path = f"/v1/holds/{hold.id}/capture"
+    with commit_after_read(
+        db, table, lambda: service.capture_hold(hold.id, capture, keyed(path, capture))
+    ):
+        if read == "hold":
+            viewed = service.get_hold(hold.id)
+            assert viewed.status == HoldStatus.ACTIVE
+            assert viewed.capture_transaction_id is None
+        else:
+            balance = service.get_balance(source, as_of=as_of)
+            assert (balance.balance, balance.held_amount, balance.available_balance) == (
+                1_000,
+                400,
+                600,
+            )
+    assert service.get_hold(hold.id).capture_transaction_id is not None
+    balance = service.get_balance(source, as_of=as_of)
+    assert (balance.balance, balance.held_amount, balance.available_balance) == (750, 0, 750)
+
+
+def test_deposit_then_reservation_cannot_cause_a_false_overdraft(
+    service: LedgerService, db: Engine
+) -> None:
+    source, destination = funded_wallets(service, 100)
+    funding = open_wallet(service, "Funding", allow_negative=True)
+
+    def deposit_and_reserve() -> None:
+        # Available is 100 before these writes, 300 after the top-up, and
+        # 100 again after the hold. A 100-unit transfer must always fit.
+        top_up = transfer_request(funding, source, 200)
+        service.transfer(top_up, keyed("/v1/transfers", top_up))
+        authorize(service, source, destination, 200)
+
+    payment = transfer_request(source, destination, 100)
+    with commit_after_read(db, "accounts", deposit_and_reserve):
+        service.transfer(payment, keyed("/v1/transfers", payment))
+    account = service.get_account(source)
+    assert (account.balance, account.held_amount, account.available_balance) == (200, 200, 0)
+    assert_reconciles(db)
+
+
+def test_second_capture_reports_the_closed_hold_when_the_first_drained_the_wallet(
+    service: LedgerService, db: Engine
+) -> None:
+    source, destination = funded_wallets(service, 100)
+    hold = authorize(service, source, destination, 100)
+    capture = HoldCapture()
+    path = f"/v1/holds/{hold.id}/capture"
+
+    def capture_with_new_key() -> None:
+        service.capture_hold(hold.id, capture, keyed(path, capture))
+
+    with (
+        commit_after_read(db, "holds", capture_with_new_key),
+        pytest.raises(HoldNotActive) as error,
+    ):
+        capture_with_new_key()
+    assert error.value.extensions["hold_status"] == "captured"
+    assert capture_count(db) == 1
+    assert service.get_account(destination).balance == 100
 
 
 def test_a_stale_balance_during_authorization_is_retried(

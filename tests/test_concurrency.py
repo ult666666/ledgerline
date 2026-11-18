@@ -185,16 +185,16 @@ def test_retries_are_bounded(db: Engine, monkeypatch: pytest.MonkeyPatch) -> Non
     assert service.get_account(source).balance == 1_000
 
 
-def test_losing_the_idempotency_key_race_rolls_back_and_replays(
+def test_losing_the_idempotency_key_race_replays_the_winner(
     service: LedgerService, db: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source, destination = funded_wallets(service, 1_000)
-    body = transfer_request(source, destination, 100)
+    body = transfer_request(source, destination, 1_000)
     request = idempotency(body, key="raced")
     first = service.transfer(body, request)
 
     # Simulate a duplicate that started before `first` committed: its initial
-    # lookup finds nothing, it does all the work, then loses on the primary key.
+    # lookup finds nothing, then the primary key resolves the competing claims.
     real_lookup = LedgerRepository.get_idempotency_record
     lookups = 0
 
@@ -208,7 +208,7 @@ def test_losing_the_idempotency_key_race_rolls_back_and_replays(
 
     assert second.replayed
     assert second.body == first.body
-    assert service.get_account(source).balance == 900
+    assert service.get_account(source).balance == 0
     assert_reconciles(db)
 
 

@@ -3,12 +3,13 @@
 Every write runs in a single database transaction that
 
 1. looks up the idempotency key and, if it was already used, replays the stored
-   response (or rejects a different request reusing the key);
+   response (or rejects a different request reusing the key); otherwise
+   reserves the key before reading the balances;
 2. validates the posting against the current balances;
 3. compare-and-swaps each touched account's stored balance (optimistic
    concurrency on a version column);
 4. inserts the journal transaction and its entries; and
-5. records the idempotency key together with the response.
+5. fills in the response on the reserved idempotency row.
 
 Either all of that commits or none of it does. If another request changed one
 of the accounts (or claimed the same key) in the meantime, the attempt is
@@ -159,10 +160,11 @@ class LedgerService:
             else:
                 # History is rebuilt from the immutable entries and the hold
                 # timestamps, not from the cached balance.
-                account = _require_account(repo, account_id)
-                signed_total = repo.sum_entries(account_id, posted_at_or_before=as_of)
+                history = repo.get_account_history(account_id, as_of=as_of)
+                if history is None:
+                    raise AccountNotFound(account_id)
+                account, signed_total, held = history
                 balance = balance_change(account.normal_balance, signed_total)
-                held = repo.sum_holds(account_id, active_at=as_of)
             return BalanceOut(
                 account_id=account.id,
                 currency=account.currency,
@@ -210,9 +212,11 @@ class LedgerService:
 
     def get_hold(self, hold_id: UUID) -> HoldOut:
         with self._session_factory() as session:
-            repo = LedgerRepository(session)
-            hold = _require_hold(repo, hold_id)
-            return _hold_out(hold, now=self._clock(), capture_id=repo.find_capture_id(hold_id))
+            found = LedgerRepository(session).get_hold_with_capture(hold_id)
+            if found is None:
+                raise HoldNotFound(hold_id)
+            hold, capture_id = found
+            return _hold_out(hold, now=self._clock(), capture_id=capture_id)
 
     # Writes
 
@@ -244,10 +248,9 @@ class LedgerService:
             EntryDraft(account_id=entry.account_id, amount=entry.amount, currency=entry.currency)
             for entry in request.entries
         ]
-        # Fail fast on malformed postings before opening a database transaction.
-        validate_entries(drafts)
 
         def operation(repo: LedgerRepository) -> TransactionOut:
+            validate_entries(drafts)
             accounts, now = self._load_accounts(repo, [draft.account_id for draft in drafts])
             return self._post(
                 repo,
@@ -371,15 +374,8 @@ class LedgerService:
         """Post the hold's transfer, for all of it or less, and release any remainder."""
 
         def operation(repo: LedgerRepository) -> HoldOut:
-            hold = _require_hold(repo, hold_id)
-            # The hold being captured no longer counts against the source: its
-            # funds become the posting itself, and the remainder is released.
-            accounts, now = self._load_accounts(
-                repo, [hold.from_account_id, hold.to_account_id], excluding_hold=hold.id
-            )
-            state = _hold_state(hold)
-            require_active(state, now)
-            amount = capture_amount(state, request.amount)
+            hold, accounts, now = self._load_active_hold(repo, hold_id, capturing=True)
+            amount = capture_amount(_hold_state(hold), request.amount)
             drafts = transfer_entries(
                 accounts[hold.from_account_id], accounts[hold.to_account_id], amount, hold.currency
             )
@@ -400,15 +396,31 @@ class LedgerService:
         """Release a hold's funds without posting anything."""
 
         def operation(repo: LedgerRepository) -> HoldOut:
-            hold = _require_hold(repo, hold_id)
-            accounts, now = self._load_accounts(repo, [hold.from_account_id])
-            require_active(_hold_state(hold), now)
+            hold, accounts, now = self._load_active_hold(repo, hold_id, capturing=False)
             _bump_version(repo, accounts[hold.from_account_id])
             if not repo.close_hold(hold, status=HoldStatus.VOIDED, at=now):
                 raise _StaleHold
             return _hold_out(hold, now=now, capture_id=None)
 
         return self._write(idempotency, HoldOut, operation)
+
+    def _load_active_hold(
+        self, repo: LedgerRepository, hold_id: UUID, *, capturing: bool
+    ) -> tuple[Hold, dict[UUID, AccountState], datetime]:
+        found = repo.get_hold_with_source_version(hold_id)
+        if found is None:
+            raise HoldNotFound(hold_id)
+        hold, source_version = found
+        # A capture spends its reservation and posts to both accounts. A void
+        # only releases the source funds.
+        ids = [hold.from_account_id, hold.to_account_id] if capturing else [hold.from_account_id]
+        accounts, now = self._load_accounts(
+            repo, ids, excluding_hold=hold.id if capturing else None
+        )
+        if accounts[hold.from_account_id].version != source_version:
+            raise _StaleHold
+        require_active(_hold_state(hold), now)
+        return hold, accounts, now
 
     def _load_accounts(
         self,
@@ -430,19 +442,24 @@ class LedgerService:
             if account_id not in found:
                 raise AccountNotFound(account_id)
         now = self._clock()
-        held = repo.held_amounts(account_ids, now=now, excluding=excluding_hold)
-        states = {
-            account.id: AccountState(
+        reservations = repo.reservation_balances(account_ids, now=now, excluding=excluding_hold)
+        states = {}
+        for account in found.values():
+            version, held = reservations[account.id]
+            # A deposit followed by a hold can increase both balance and held.
+            # Mixing the old balance with the new hold can falsely refuse a
+            # spend before its compare-and-swap has a chance to notice.
+            if account.version != version:
+                raise _StaleBalance
+            states[account.id] = AccountState(
                 id=account.id,
                 currency=account.currency,
                 normal_balance=account.normal_balance,
                 allow_negative=account.allow_negative,
                 balance=account.balance,
-                version=account.version,
-                held=held.get(account.id, 0),
+                version=version,
+                held=held,
             )
-            for account in found.values()
-        }
         return states, now
 
     def _post(
@@ -473,12 +490,9 @@ class LedgerService:
                 raise _StaleBalance
         if capture is not None:
             hold, amount = capture
-            # Close the hold before inserting anything. On PostgreSQL a rival
-            # capture or void can commit between our read of the hold and our
-            # read of the accounts; our compare-and-swap then passes, so the
-            # guarded transition is what refuses this attempt (it retries and
-            # reports the hold as closed). Inserting first would trip the
-            # UNIQUE hold_id constraint instead.
+            # The guarded transition is the final check on the hold. Close it
+            # before inserting the journal so any losing attempt retries before
+            # it could collide with the unique capture link.
             if not repo.close_hold(
                 hold, status=HoldStatus.CAPTURED, at=posted_at, captured_amount=amount
             ):
@@ -514,23 +528,27 @@ class LedgerService:
             try:
                 with self._session_factory.begin() as session:
                     repo = LedgerRepository(session)
+                    record = None
                     if idempotency is not None:
                         record = repo.get_idempotency_record(idempotency.principal, idempotency.key)
                         if record is not None:
                             return WriteResult(
                                 _replay(record, idempotency, response_model), replayed=True
                             )
-                    body = operation(repo)
-                    if idempotency is not None:
-                        repo.add_idempotency_record(
-                            IdempotencyRecord(
-                                principal=idempotency.principal,
-                                key=idempotency.key,
-                                fingerprint=idempotency.fingerprint,
-                                response_body=body.model_dump(mode="json"),
-                                created_at=self._clock(),
-                            )
+                        # Claim the key before checking balances or hold state. A
+                        # simultaneous retry must see the winner's response even if
+                        # the winner emptied the wallet or closed the hold.
+                        record = IdempotencyRecord(
+                            principal=idempotency.principal,
+                            key=idempotency.key,
+                            fingerprint=idempotency.fingerprint,
+                            response_body={},
+                            created_at=self._clock(),
                         )
+                        repo.add_idempotency_record(record)
+                    body = operation(repo)
+                    if record is not None:
+                        record.response_body = body.model_dump(mode="json")
                     return WriteResult(body, replayed=False)
             except (_StaleBalance, _StaleHold, DuplicateIdempotencyKey) as conflict:
                 logger.info(
@@ -557,13 +575,6 @@ def _require_account(repo: LedgerRepository, account_id: UUID) -> Account:
     if account is None:
         raise AccountNotFound(account_id)
     return account
-
-
-def _require_hold(repo: LedgerRepository, hold_id: UUID) -> Hold:
-    hold = repo.get_hold(hold_id)
-    if hold is None:
-        raise HoldNotFound(hold_id)
-    return hold
 
 
 def _bump_version(repo: LedgerRepository, account: AccountState) -> None:

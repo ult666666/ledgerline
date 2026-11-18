@@ -222,6 +222,8 @@ for attempt in 1..10:
     BEGIN
       record = SELECT * FROM idempotency_keys WHERE principal = ? AND key = ?
       if record: COMMIT and return the stored response (or 409 if the fingerprint differs)
+      INSERT INTO idempotency_keys (principal, key, fingerprint, response_body)
+          if the primary key already exists: ROLLBACK, back off, retry (and replay)
 
       accounts = SELECT * FROM accounts WHERE id IN (...)
       check currencies, compute new balances, refuse overdrafts     -- domain.py
@@ -231,8 +233,7 @@ for attempt in 1..10:
           WHERE id = ? AND version = version_read                  -- compare-and-swap
           if 0 rows changed: ROLLBACK, back off, retry
       INSERT INTO transactions ...; INSERT INTO entries ...
-      INSERT INTO idempotency_keys (principal, key, fingerprint, response_body)
-          if the primary key already exists: ROLLBACK, back off, retry (and replay)
+      UPDATE idempotency_keys SET response_body = ? WHERE principal = ? AND key = ?
     COMMIT
 raise ConcurrentUpdate  (409, Retry-After: 1)
 ```
@@ -353,13 +354,14 @@ that are summed on read.
   commit, nothing happened and a retry executes normally; if it crashes after
   the commit but before responding, the retry finds the row and replays. There
   is no window in which money moved but the key was not recorded.
-- **Races.** Two identical requests can both find no record and both do the
-  work. Only one can insert `(principal, key)`; the other gets a primary-key
-  violation (on PostgreSQL it first waits for the winner's uncommitted
-  insert), rolls back its own ledger changes, retries, and replays the
-  winner's response. In practice the loser usually fails the balance
-  compare-and-swap first, with the same outcome. `test_concurrency.py` forces
-  this path deterministically.
+- **Races.** Two requests can both find no record. Each tries to insert
+  `(principal, key)` before reading account balances or validating a hold.
+  On PostgreSQL the primary key lets one proceed while the other waits. If
+  the first commits, the other rolls back its failed insert and looks up the
+  completed response. If the first rolls back, the other's insert succeeds.
+  Other sessions can only see the response once the ledger changes commit.
+  This matters when the first transfer drains a wallet. A duplicate still
+  receives the successful transfer even though a new transfer would fail.
 - **Only successes are stored.** A request that fails validation or a business
   rule rolls back entirely, the key included, so the client can fix the
   problem and retry with the same key. Stripe instead stores the outcome of any
@@ -376,7 +378,10 @@ that are summed on read.
 
 `GET /v1/accounts/{id}/balance?as_of=T` sums the account's entries whose
 transaction has `posted_at <= T`; history is rebuilt from the immutable
-journal, not from the cached balance.
+journal, not from the cached balance. The same SELECT sums holds that were
+active at T. A capture changes both totals together. Reading the sums in
+separate SELECTs under PostgreSQL READ COMMITTED could pair the old posted
+balance with the newly released reservation.
 
 For that history to be consistent, `posted_at` must order transactions on the
 same account the way they were applied. `_post` takes the timestamp *after*
@@ -527,16 +532,17 @@ an account's available balance goes through that account's compare-and-swap:
   the others wait for the winner's commit, re-check the `WHERE` clause and
   match nothing. The loser rolls back, retries, sees the closed hold and
   answers `409 hold-not-active`.
+- **Read versions before validating.** The service reads the version with each
+  account's balance, then reads it again alongside its active reservations at
+  the posting time. If a deposit and a new hold committed in between, the
+  write retries before it can combine the old balance with the new reservation
+  and report a false overdraft. A capture or void also reads the source version
+  with the hold, so a rival that closed the hold cannot leave the next request
+  validating an active hold against a wallet the winner has already drained.
 - **Order of writes in a capture.** The capture swaps the account balances,
-  then closes the hold, then inserts the journal rows. Running the suite on
-  PostgreSQL showed why the order matters. At Read Committed each statement
-  sees what had committed when it started, so a capture can read the hold
-  before a rival capture commits and read the accounts after it. Its balance
-  compare-and-swap then passes. When the insert came first, the duplicate
-  posting hit `UNIQUE (hold_id)` and the client got a 500; closing the hold
-  first turns it into the retry above. A test reproduces the interleaving
-  deterministically. The same reasoning moved the "already reversed?" check
-  in reversals after the balance read, which fixed the same latent race there.
+  conditionally closes the hold, then inserts the journal transaction. A failed
+  transition rolls back the balances and retries before any insert can conflict
+  with the unique capture link.
 - **Lock order.** Accounts in id order, then the hold row, in every write that
   touches a hold. Voids rewrite the source account (version bump) before the
   hold row, so no two writers wait on each other in a cycle.
@@ -547,7 +553,8 @@ could be refused on stale data.
 
 All three hold writes need an `Idempotency-Key` and use the machinery from
 section 8. A replay returns the original response, even if the hold has since
-expired or been captured; `GET /v1/holds/{id}` shows the current state.
+expired or been captured; `GET /v1/holds/{id}` joins the hold and its capture
+transaction in one SELECT so the reported status and journal link agree.
 
 **Compatibility.** Earlier responses stored under idempotency keys lack the
 new response fields (`held_amount`, `available_balance`, `captures_hold_id`).
