@@ -3,12 +3,13 @@
 Every write runs in a single database transaction that
 
 1. looks up the idempotency key and, if it was already used, replays the stored
-   response (or rejects a different request reusing the key);
+   response (or rejects a different request reusing the key); otherwise
+   reserves the key before reading the balances;
 2. validates the posting against the current balances;
 3. compare-and-swaps each touched account's stored balance (optimistic
    concurrency on a version column);
 4. inserts the journal transaction and its entries; and
-5. records the idempotency key together with the response.
+5. fills in the response on the reserved idempotency row.
 
 Either all of that commits or none of it does. If another request changed one
 of the accounts (or claimed the same key) in the meantime, the attempt is
@@ -244,10 +245,9 @@ class LedgerService:
             EntryDraft(account_id=entry.account_id, amount=entry.amount, currency=entry.currency)
             for entry in request.entries
         ]
-        # Fail fast on malformed postings before opening a database transaction.
-        validate_entries(drafts)
 
         def operation(repo: LedgerRepository) -> TransactionOut:
+            validate_entries(drafts)
             accounts, now = self._load_accounts(repo, [draft.account_id for draft in drafts])
             return self._post(
                 repo,
@@ -514,23 +514,27 @@ class LedgerService:
             try:
                 with self._session_factory.begin() as session:
                     repo = LedgerRepository(session)
+                    record = None
                     if idempotency is not None:
                         record = repo.get_idempotency_record(idempotency.principal, idempotency.key)
                         if record is not None:
                             return WriteResult(
                                 _replay(record, idempotency, response_model), replayed=True
                             )
-                    body = operation(repo)
-                    if idempotency is not None:
-                        repo.add_idempotency_record(
-                            IdempotencyRecord(
-                                principal=idempotency.principal,
-                                key=idempotency.key,
-                                fingerprint=idempotency.fingerprint,
-                                response_body=body.model_dump(mode="json"),
-                                created_at=self._clock(),
-                            )
+                        # Claim the key before checking balances or hold state. A
+                        # simultaneous retry must see the winner's response even if
+                        # the winner emptied the wallet or closed the hold.
+                        record = IdempotencyRecord(
+                            principal=idempotency.principal,
+                            key=idempotency.key,
+                            fingerprint=idempotency.fingerprint,
+                            response_body={},
+                            created_at=self._clock(),
                         )
+                        repo.add_idempotency_record(record)
+                    body = operation(repo)
+                    if record is not None:
+                        record.response_body = body.model_dump(mode="json")
                     return WriteResult(body, replayed=False)
             except (_StaleBalance, _StaleHold, DuplicateIdempotencyKey) as conflict:
                 logger.info(

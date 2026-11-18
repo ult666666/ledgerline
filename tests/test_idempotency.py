@@ -1,6 +1,8 @@
 """Idempotency-Key semantics for money-moving endpoints."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +13,7 @@ from ledgerline.api.app import create_app
 from ledgerline.config import Settings
 from ledgerline.idempotency import request_fingerprint
 from ledgerline.models import IdempotencyRecord
+from ledgerline.repository import LedgerRepository
 from ledgerline.schemas import ReversalCreate
 from tests.support import Json, balance, deposit, open_account, post, problem_type
 
@@ -111,6 +114,76 @@ def test_same_key_with_a_different_body_is_rejected(
     assert response.status_code == 409
     assert problem_type(response) == "idempotency-key-reused"
     assert balance(client, alice) == 7_500
+
+
+@pytest.mark.parametrize("retry_amount", [10_000, 500])
+def test_late_duplicate_sees_the_committed_key_after_the_wallet_is_drained(
+    client: TestClient,
+    wallets: tuple[Json, Json],
+    db: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_amount: int,
+) -> None:
+    if db.dialect.name != "postgresql":
+        pytest.skip("SQLite serializes requests before the initial key lookup")
+    alice, bob = wallets
+    key = "last-available-funds"
+    read_key, winner_committed = Event(), Event()
+    lookup = LedgerRepository.get_idempotency_record
+
+    def pause_after_first_lookup(
+        repo: LedgerRepository, principal: str, requested_key: str
+    ) -> IdempotencyRecord | None:
+        record = lookup(repo, principal, requested_key)
+        if requested_key == key and record is None and not read_key.is_set():
+            read_key.set()
+            assert winner_committed.wait(timeout=10)
+        return record
+
+    monkeypatch.setattr(LedgerRepository, "get_idempotency_record", pause_after_first_lookup)
+    # Let a real second connection drain the wallet between the retry's first
+    # key lookup and its balance read at PostgreSQL READ COMMITTED.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            post, client, "/v1/transfers", transfer_body(alice, bob, retry_amount), key=key
+        )
+        try:
+            assert read_key.wait(timeout=10)
+            first = post(client, "/v1/transfers", transfer_body(alice, bob, 10_000), key=key)
+        finally:
+            winner_committed.set()
+        retry = pending.result(timeout=10)
+
+    assert first.status_code == 201
+    if retry_amount == 10_000:
+        assert retry.status_code == 201
+        assert retry.json() == first.json()
+        assert retry.headers["Idempotent-Replayed"] == "true"
+    else:
+        assert retry.status_code == 409
+        assert problem_type(retry) == "idempotency-key-reused"
+    assert balance(client, alice) == 0
+    assert balance(client, bob) == 10_000
+    assert statement_length(client, bob) == 1
+
+
+def test_used_key_is_checked_before_journal_rules(
+    client: TestClient, wallets: tuple[Json, Json]
+) -> None:
+    alice, bob = wallets
+    key = "journal"
+    first = post(client, "/v1/transfers", transfer_body(alice, bob, 100), key=key)
+    assert first.status_code == 201
+    invalid_entries = [
+        {"account_id": alice["id"], "amount": 10, "currency": "USD"},
+        {"account_id": bob["id"], "amount": -20, "currency": "USD"},
+    ]
+    reused = post(client, "/v1/transactions", {"entries": invalid_entries}, key=key)
+    assert reused.status_code == 409
+    assert problem_type(reused) == "idempotency-key-reused"
+    fresh = post(client, "/v1/transactions", {"entries": invalid_entries})
+    assert fresh.status_code == 422
+    assert problem_type(fresh) == "unbalanced-transaction"
 
 
 def test_same_key_on_a_different_endpoint_is_rejected(

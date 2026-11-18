@@ -115,10 +115,10 @@ handles each:
 | Editing a posted record makes balances impossible to audit | There are no update or delete endpoints. A correction is a reversal transaction, at most one per transaction. |
 | Money reserved by a hold gets spent twice | Holds and postings both draw on the available balance (ledger minus held) under the same compare-and-swap. |
 
-A write runs in one database transaction: look up the idempotency key, load the
-accounts, apply the posting rules, compare-and-swap each balance
-(`UPDATE ... WHERE id = ? AND version = ?`) in a fixed order, insert the journal rows,
-store the response under the key, and commit. If an account changed underneath, or a
+A write claims its idempotency key before it reads the accounts. Within the same
+database transaction it applies the posting rules, compare-and-swaps each balance
+(`UPDATE ... WHERE id = ? AND version = ?`) in a fixed order, inserts the journal rows,
+saves the response under the key, and commits. If an account changed underneath, or a
 concurrent duplicate claimed the key, everything rolls back and the request is retried
 with fresh data, up to 10 attempts with jittered backoff. `ledgerline reconcile`
 recomputes the invariants from the journal.

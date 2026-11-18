@@ -222,6 +222,8 @@ for attempt in 1..10:
     BEGIN
       record = SELECT * FROM idempotency_keys WHERE principal = ? AND key = ?
       if record: COMMIT and return the stored response (or 409 if the fingerprint differs)
+      INSERT INTO idempotency_keys (principal, key, fingerprint, response_body)
+          if the primary key already exists: ROLLBACK, back off, retry (and replay)
 
       accounts = SELECT * FROM accounts WHERE id IN (...)
       check currencies, compute new balances, refuse overdrafts     -- domain.py
@@ -231,8 +233,7 @@ for attempt in 1..10:
           WHERE id = ? AND version = version_read                  -- compare-and-swap
           if 0 rows changed: ROLLBACK, back off, retry
       INSERT INTO transactions ...; INSERT INTO entries ...
-      INSERT INTO idempotency_keys (principal, key, fingerprint, response_body)
-          if the primary key already exists: ROLLBACK, back off, retry (and replay)
+      UPDATE idempotency_keys SET response_body = ? WHERE principal = ? AND key = ?
     COMMIT
 raise ConcurrentUpdate  (409, Retry-After: 1)
 ```
@@ -353,13 +354,14 @@ that are summed on read.
   commit, nothing happened and a retry executes normally; if it crashes after
   the commit but before responding, the retry finds the row and replays. There
   is no window in which money moved but the key was not recorded.
-- **Races.** Two identical requests can both find no record and both do the
-  work. Only one can insert `(principal, key)`; the other gets a primary-key
-  violation (on PostgreSQL it first waits for the winner's uncommitted
-  insert), rolls back its own ledger changes, retries, and replays the
-  winner's response. In practice the loser usually fails the balance
-  compare-and-swap first, with the same outcome. `test_concurrency.py` forces
-  this path deterministically.
+- **Races.** Two requests can both find no record. Each tries to insert
+  `(principal, key)` before reading account balances or validating a hold.
+  On PostgreSQL the primary key lets one proceed while the other waits. If
+  the first commits, the other rolls back its failed insert and looks up the
+  completed response. If the first rolls back, the other's insert succeeds.
+  Other sessions can only see the response once the ledger changes commit.
+  This matters when the first transfer drains a wallet. A duplicate still
+  receives the successful transfer even though a new transfer would fail.
 - **Only successes are stored.** A request that fails validation or a business
   rule rolls back entirely, the key included, so the client can fix the
   problem and retry with the same key. Stripe instead stores the outcome of any

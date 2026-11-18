@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Concurrent requests using the same idempotency key now agree on the first
+  successful response even when that write spent the remaining funds or closed
+  a hold. Reusing a committed key for a different, schema-valid journal request
+  consistently returns `409 idempotency-key-reused`.
+
 ## 0.2.0 - 2026-11-05
 
 ### Added
