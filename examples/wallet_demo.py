@@ -1,7 +1,8 @@
 """Run a real HTTP wallet lifecycle in a disposable, owned SQLite service.
 
-Usage: ``uv run python examples/wallet_demo.py``. No existing database, server,
-API key, Docker or payment provider is used. See docs/WALLET_DEMO.md.
+Usage: ``uv run python examples/wallet_demo.py [--holds]``. The default walks
+through transfers and a reversal. Use --holds for authorization, capture,
+replay and void. See docs/WALLET_DEMO.md.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -200,25 +202,14 @@ class DemoServer:
         self.close()
 
 
-def exercise_wallet(server: DemoServer) -> Json:
-    """Post, replay, reject and reverse through real HTTP; check each invariant."""
+def fund_wallets(server: DemoServer) -> tuple[dict[str, str], Json]:
+    """Open the cash and wallet accounts and deposit $100 into Alice's wallet."""
     accounts = {}
     for name, account_type in (("cash", "asset"), ("alice", "liability"), ("bob", "liability")):
         account = server.request(
             "POST", "/v1/accounts", {"name": name, "type": account_type, "currency": "USD"}
         ).expect(201)
         accounts[name] = str(account["id"])
-
-    def balances(as_of: str | None = None) -> dict[str, int]:
-        query = "" if as_of is None else "?" + urlencode({"as_of": as_of})
-        return {
-            name: int(
-                server.request("GET", f"/v1/accounts/{account_id}/balance{query}").expect(200)[
-                    "balance"
-                ]
-            )
-            for name, account_id in accounts.items()
-        }
 
     deposit = server.request(
         "POST",
@@ -232,6 +223,24 @@ def exercise_wallet(server: DemoServer) -> Json:
         },
         key="deposit-alice",
     ).expect(201)
+    return accounts, deposit
+
+
+def exercise_wallet(server: DemoServer) -> Json:
+    """Post, replay, reject and reverse through real HTTP; check each invariant."""
+    accounts, deposit = fund_wallets(server)
+
+    def balances(as_of: str | None = None) -> dict[str, int]:
+        query = "" if as_of is None else "?" + urlencode({"as_of": as_of})
+        return {
+            name: int(
+                server.request("GET", f"/v1/accounts/{account_id}/balance{query}").expect(200)[
+                    "balance"
+                ]
+            )
+            for name, account_id in accounts.items()
+        }
+
     transfer_body = {
         "from_account_id": accounts["alice"],
         "to_account_id": accounts["bob"],
@@ -302,27 +311,108 @@ def exercise_wallet(server: DemoServer) -> Json:
     }
 
 
-def run_demo(timeout: float = 15.0) -> Json:
+def exercise_holds(server: DemoServer) -> Json:
+    """Authorize, partially capture, retry and void through the HTTP API."""
+    accounts, _ = fund_wallets(server)
+    wallet = f"/v1/accounts/{accounts['alice']}/balance"
+    steps: list[Json] = []
+
+    def record(step: str, *, balance: int, held: int) -> None:
+        observed = server.request("GET", wallet).expect(200)
+        values = {
+            field: observed[field] for field in ("balance", "held_amount", "available_balance")
+        }
+        expected = {"balance": balance, "held_amount": held, "available_balance": balance - held}
+        if values != expected:
+            raise DemoError(f"{step}: expected {expected}, got {values}")
+        steps.append({"step": step, **values})
+
+    def authorize(amount: int, key: str) -> str:
+        body = {
+            "from_account_id": accounts["alice"],
+            "to_account_id": accounts["bob"],
+            "amount": amount,
+            "currency": "USD",
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+        authorized = server.request("POST", "/v1/holds", body, key=key).expect(201)
+        if authorized["status"] != "active":
+            raise DemoError(f"authorization returned {authorized['status']!r}")
+        return str(authorized["id"])
+
+    record("funded", balance=10_000, held=0)
+    ride = authorize(4_000, "ride")
+    record("authorized", balance=10_000, held=4_000)
+
+    path = f"/v1/holds/{ride}/capture"
+    amount = {"amount": 3_200}
+    capture = server.request("POST", path, amount, key="ride-capture").expect(200)
+    if capture["status"] != "captured" or capture["captured_amount"] != 3_200:
+        raise DemoError("the partial capture did not record the fare")
+    record("partially_captured", balance=6_800, held=0)
+    retry = server.request("POST", path, amount, key="ride-capture")
+    replayed = retry.expect(200)
+    transaction_id = capture["capture_transaction_id"]
+    replay = {
+        "idempotent_replayed": retry.headers.get("idempotent-replayed") == "true",
+        "same_response": replayed == capture,
+        "same_capture_transaction": transaction_id is not None
+        and transaction_id == replayed["capture_transaction_id"],
+    }
+    if not all(replay.values()):
+        raise DemoError(f"capture replay failed: {replay}")
+    record("capture_replayed", balance=6_800, held=0)
+
+    reservation = authorize(1_500, "second-ride")
+    record("second_authorized", balance=6_800, held=1_500)
+    void = server.request("POST", f"/v1/holds/{reservation}/void", key="cancel-ride").expect(200)
+    if void["status"] != "voided" or void["capture_transaction_id"] is not None:
+        raise DemoError("the cancelled ride has an unexpected status or capture")
+    record("voided", balance=6_800, held=0)
+    return {
+        "scenario": "wallet-holds",
+        "wallet": "alice",
+        "currency": "USD",
+        "amount_unit": "integer cents",
+        "steps": steps,
+        "replay": replay,
+    }
+
+
+def run_demo(timeout: float = 15.0, *, holds: bool = False) -> Json:
     """Return a checked receipt only after shutting down and deleting owned resources."""
     server = DemoServer(timeout)
     with server:
-        receipt = exercise_wallet(server)
+        receipt = exercise_holds(server) if holds else exercise_wallet(server)
         engine = create_db_engine(server.database_url)
         try:
             with Session(engine) as session:
                 report = reconcile(session)
         finally:
             engine.dispose()
-        if not report.ok or (report.accounts, report.transactions, report.entries) != (3, 3, 6):
+        counts = (report.accounts, report.transactions, report.entries, report.holds)
+        if not report.ok or counts != ((3, 2, 4, 2) if holds else (3, 3, 6, 0)):
             raise DemoError(report.render())
-        receipt["reconciliation"] = {"ok": report.ok, **dataclasses.asdict(report)}
+    removed = server.database_path is not None and not server.database_path.exists()
+    if holds:
+        receipt["reconciliation"] = {
+            "ok": report.ok,
+            "accounts": report.accounts,
+            "transactions": report.transactions,
+            "entries": report.entries,
+            "holds": report.holds,
+            "trial_balance": report.trial_balance,
+        }
+        receipt["cleanup"] = {"server_stopped": server.server_stopped, "database_removed": removed}
+        return receipt
+    receipt["reconciliation"] = {"ok": report.ok, **dataclasses.asdict(report)}
     receipt["cleanup"] = {
         "host": "127.0.0.1",
         "port": server.port,
         "server_pid": server.server_pid,
         "server_stopped": server.server_stopped,
         "database_path": str(server.database_path),
-        "database_removed": server.database_path is not None and not server.database_path.exists(),
+        "database_removed": removed,
     }
     return receipt
 
@@ -332,9 +422,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=float, default=15.0, help="shared startup/HTTP deadline in seconds"
     )
+    parser.add_argument(
+        "--holds",
+        action="store_true",
+        help="show a hold authorization, partial capture, replay and void",
+    )
     args = parser.parse_args(argv)
     try:
-        receipt = run_demo(args.timeout)
+        receipt = run_demo(args.timeout, holds=args.holds)
     except (DemoError, ValueError, OSError) as exc:
         print(f"wallet-demo: error: {exc}", file=sys.stderr)
         return 1

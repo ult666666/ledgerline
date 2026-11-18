@@ -68,6 +68,49 @@ def test_actual_cli_wallet_receipt_and_caller_database_isolation(tmp_path: Path)
     assert "Bearer" not in result.stdout
 
 
+def test_holds_cli_reports_observed_balances_and_a_repeatable_receipt(tmp_path: Path) -> None:
+    command = [sys.executable, str(EXAMPLE), "--holds"]
+    runs = [
+        subprocess.run(  # noqa: S603 -- fixed interpreter and repository-owned script
+            command, cwd=tmp_path, capture_output=True, text=True, timeout=25, check=True
+        ).stdout
+        for _ in range(2)
+    ]
+    assert runs[0] == runs[1]
+    receipt = json.loads(runs[0])
+    assert receipt["scenario"] == "wallet-holds"
+    assert (receipt["wallet"], receipt["currency"], receipt["amount_unit"]) == (
+        "alice",
+        "USD",
+        "integer cents",
+    )
+    assert [
+        (s["step"], s["balance"], s["held_amount"], s["available_balance"])
+        for s in receipt["steps"]
+    ] == [
+        ("funded", 10_000, 0, 10_000),
+        ("authorized", 10_000, 4_000, 6_000),
+        ("partially_captured", 6_800, 0, 6_800),
+        ("capture_replayed", 6_800, 0, 6_800),
+        ("second_authorized", 6_800, 1_500, 5_300),
+        ("voided", 6_800, 0, 6_800),
+    ]
+    assert receipt["replay"] == {
+        "idempotent_replayed": True,
+        "same_response": True,
+        "same_capture_transaction": True,
+    }
+    assert receipt["reconciliation"] == {
+        "ok": True,
+        "accounts": 3,
+        "transactions": 2,
+        "entries": 4,
+        "holds": 2,
+        "trial_balance": {"USD": 0},
+    }
+    assert receipt["cleanup"] == {"server_stopped": True, "database_removed": True}
+
+
 def test_real_http_context_error_cleans_only_its_resources() -> None:
     demo = demo_module()
     # An unrelated listener remains open while the owned server comes and goes.
